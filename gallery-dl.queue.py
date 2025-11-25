@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import codecs
+import re
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -47,6 +48,14 @@ DOWNLOAD_BASE_URL = "https://github.com/mikf/gallery-dl/releases/download/"
 DEFAULT_BINARY_NAME = (
     "gallery-dl.exe" if sys.platform.startswith("win") else "gallery-dl"
 )
+
+# Strip ANSI color codes so log pattern matching remains stable even when
+# gallery-dl writes colored output.
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text)
 
 
 class UpdateError(Exception):
@@ -198,7 +207,7 @@ def _write_update_state(timestamp: datetime, **extra) -> None:
 class Config:
     def __init__(self):
         self.workers = 3
-        self.max_retries = 15
+        self.max_retries = 10
         self.retry_delay = 60  # seconds
         self.download_dir = None
         self.gallery_dl_path = None
@@ -466,6 +475,10 @@ class GDLQueue:
         self.worker_progress_lock = threading.Lock()
         self.failed_downloads_lock = threading.Lock()
         self.failed_downloads: Dict[str, FailedEntry] = {}
+        self.worker_active_urls: Dict[int, str] = {}
+        self.worker_active_lock = threading.Lock()
+        self.unsupported_lock = threading.Lock()
+        self.unsupported_details: Dict[str, str] = {}
         if failed_seed:
             self.import_failed_entries(failed_seed, replace=True)
 
@@ -502,6 +515,35 @@ class GDLQueue:
         with self.worker_log_lock:
             self.worker_logs[worker_id].append(message)
         self.worker_log_events[worker_id].set()
+
+    def _set_worker_active_url(self, worker_id: int, url: Optional[str]) -> None:
+        with self.worker_active_lock:
+            if url is None:
+                self.worker_active_urls.pop(worker_id, None)
+            else:
+                self.worker_active_urls[worker_id] = url
+
+    def _get_worker_active_url(self, worker_id: int) -> Optional[str]:
+        with self.worker_active_lock:
+            return self.worker_active_urls.get(worker_id)
+
+    def _flag_unsupported(self, url: str, detail: str):
+        if not url:
+            return
+        with self.unsupported_lock:
+            self.unsupported_details[url] = detail
+
+    def _consume_unsupported(self, url: str) -> Optional[str]:
+        if not url:
+            return None
+        with self.unsupported_lock:
+            return self.unsupported_details.pop(url, None)
+
+    def _clear_unsupported(self, url: str) -> None:
+        if not url:
+            return
+        with self.unsupported_lock:
+            self.unsupported_details.pop(url, None)
 
     def _set_worker_progress(self, worker_id: int, text: str) -> None:
         self._ensure_worker_tracking(worker_id)
@@ -655,13 +697,19 @@ class GDLQueue:
             nonlocal in_progress
             if buffer and not in_progress:
                 line = "".join(buffer)
+                clean_line = _strip_ansi(line)
+                lowered = clean_line.lower()
+                if "unsupported url" in lowered or "no suitable extractor" in lowered:
+                    current_url = self._get_worker_active_url(worker_id)
+                    detail = clean_line.strip() or line.strip()
+                    self._flag_unsupported(current_url or "", detail)
                 self._record_worker_output(worker_id, f"{tag} {line}")
                 buffer.clear()
             in_progress = False
 
         def _process_char(ch: str) -> None:
             nonlocal in_progress
-            if ch == "\r":
+            if ch == "\r" and os.name != "nt":
                 if buffer:
                     self._set_worker_progress(worker_id, "".join(buffer))
                 buffer.clear()
@@ -764,6 +812,9 @@ class GDLQueue:
                     self.q.task_done()
                     break
 
+                self._set_worker_active_url(worker_id, url)
+                self._clear_unsupported(url)
+
                 # Determine directory resolution for command and status reporting
                 worker_dir = self.get_worker_download_dir(worker_id)
                 download_base = (
@@ -829,7 +880,7 @@ class GDLQueue:
                             break
 
                 if not has_output_mode:
-                    cmd.extend(["-o", "output.mode=color"])
+                    cmd.extend(["-o", "output.mode=text"])
 
                 cmd.append(url)
                 # Execute download
@@ -872,7 +923,7 @@ class GDLQueue:
                     stderr_thread.start()
 
                     try:
-                        return_code = proc.wait(timeout=86.400)
+                        return_code = proc.wait(timeout=86400)
                     except subprocess.TimeoutExpired:
                         timed_out = True
                         self._record_worker_output(
@@ -888,12 +939,21 @@ class GDLQueue:
                         stderr_thread.join(timeout=1)
 
                     success = (return_code == 0) and not timed_out
+                    unsupported_detail = self._consume_unsupported(url)
 
+                    should_retry = False
                     if (
                         not success
                         and not timed_out
                         and retry_count < self.config.max_retries
                     ):
+                        if not unsupported_detail:
+                            # Pipelines may flush "Unsupported URL" slightly after process exit.
+                            time.sleep(0.2)
+                            unsupported_detail = self._consume_unsupported(url)
+                        should_retry = not unsupported_detail
+
+                    if should_retry:
                         attempt = retry_count + 1
                         self.stats.record_retry()
                         self._record_worker_output(
@@ -911,6 +971,7 @@ class GDLQueue:
                         self.stats.add_completion(url, success, duration, worker_id)
 
                         if success:
+                            self._clear_unsupported(url)
                             self.completed_urls.add(url)
                             self._clear_failed_download(url)
                             self._record_worker_output(
@@ -922,7 +983,15 @@ class GDLQueue:
                                 f"({duration:.1f}s)"
                             )
                         else:
-                            if timed_out:
+                            if unsupported_detail:
+                                self._record_worker_output(
+                                    worker_id,
+                                    f"[UNSUPPORTED] {unsupported_detail}",
+                                )
+                                print(
+                                    f"{Fore.RED}UNSUPPORTED: Worker {worker_id}: gallery-dl rejected {url}\n  -> {unsupported_detail}"
+                                )
+                            elif timed_out:
                                 self._record_worker_output(
                                     worker_id,
                                     "[FAIL] Download timed out after 86400s",
@@ -966,6 +1035,7 @@ class GDLQueue:
                         stdout_thread.join(timeout=0.5)
                     if stderr_thread is not None and stderr_thread.is_alive():
                         stderr_thread.join(timeout=0.5)
+                    self._set_worker_active_url(worker_id, None)
                     self.clear_worker_progress(worker_id)
                     self.q.task_done()
 
@@ -1214,12 +1284,11 @@ class InteractiveQueue(cmd.Cmd):
                     self.failed_offline.clear()
                 print(f"STARTED: {self.config.workers} workers")
 
-                # Start auto-status updates if enabled
                 if self.config.auto_status:
                     self._start_status_updates()
-
-            except Exception as e:
-                print(f"{Fore.RED}Failed to create downloader: {e}")
+            except Exception as exc:
+                print(f"{Fore.RED}Failed to start workers: {exc}")
+                self.dlq = None
                 return False
         return True
 
