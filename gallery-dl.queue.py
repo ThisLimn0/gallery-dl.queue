@@ -880,7 +880,7 @@ class GDLQueue:
                             break
 
                 if not has_output_mode:
-                    cmd.extend(["-o", "output.mode=text"])
+                    cmd.extend(["-o", "output.mode=pipe"])
 
                 cmd.append(url)
                 # Execute download
