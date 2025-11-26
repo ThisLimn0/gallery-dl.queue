@@ -19,7 +19,17 @@ import re
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import BinaryIO, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
+from typing import (
+    BinaryIO,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+)
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -402,6 +412,10 @@ class DownloadStats:
         with self._lock:
             return dict(self.current_downloads)
 
+    def has_active_downloads(self) -> bool:
+        with self._lock:
+            return bool(self.current_downloads)
+
     def is_worker_active(self, worker_id: int) -> bool:
         with self._lock:
             return worker_id in self.current_downloads
@@ -418,13 +432,14 @@ class DownloadStats:
 
             success_rate = (self.completed / total) * 100
             avg_time = self.total_time / total if total > 0 else 0
+            fail_color = Fore.RED if self.failed else Fore.WHITE
 
             return (
-                f"STATS: {Fore.GREEN}{total} downloads "
-                f"({Fore.GREEN}{self.completed} success, "
-                f"{Fore.RED}{self.failed} failed) "
-                f"- {success_rate:.1f}% success rate, "
-                f"avg {avg_time:.1f}s per download"
+                f"{Fore.WHITE}STATS: {total} downloads "
+                f"({Fore.GREEN}{self.completed} success{Fore.WHITE}, "
+                f"{fail_color}{self.failed} failed{Fore.WHITE}) - "
+                f"{success_rate:.1f}% success rate, avg {avg_time:.1f}s per download"
+                f"{Style.RESET_ALL}"
             )
 
 
@@ -479,6 +494,8 @@ class GDLQueue:
         self.worker_active_lock = threading.Lock()
         self.unsupported_lock = threading.Lock()
         self.unsupported_details: Dict[str, str] = {}
+        self.idle_callback: Optional[Callable[[], None]] = None
+        self.multi_active_since_idle = False
         if failed_seed:
             self.import_failed_entries(failed_seed, replace=True)
 
@@ -496,6 +513,9 @@ class GDLQueue:
             )
             thread.start()
             self.threads.append(thread)
+
+    def set_idle_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        self.idle_callback = callback
 
     # Worker tracking --------------------------------------------------
     def _ensure_worker_tracking(self, worker_id: int):
@@ -515,6 +535,15 @@ class GDLQueue:
         with self.worker_log_lock:
             self.worker_logs[worker_id].append(message)
         self.worker_log_events[worker_id].set()
+
+    def _maybe_notify_all_idle(self) -> None:
+        if self.multi_active_since_idle and not self.stats.has_active_downloads():
+            self.multi_active_since_idle = False
+            if self.idle_callback:
+                try:
+                    self.idle_callback()
+                except Exception:
+                    pass
 
     def _set_worker_active_url(self, worker_id: int, url: Optional[str]) -> None:
         with self.worker_active_lock:
@@ -845,6 +874,10 @@ class GDLQueue:
 
                 # Track current download with resolved directory
                 self.stats.set_current_download(worker_id, url, active_dir)
+                if not self.multi_active_since_idle:
+                    active_now = self.stats.snapshot_active()
+                    if len(active_now) >= 2:
+                        self.multi_active_since_idle = True
 
                 # Reset any previous progress indicator before starting a new task
                 self.clear_worker_progress(worker_id)
@@ -969,6 +1002,7 @@ class GDLQueue:
                     else:
                         duration = time.time() - start_time
                         self.stats.add_completion(url, success, duration, worker_id)
+                        self._maybe_notify_all_idle()
 
                         if success:
                             self._clear_unsupported(url)
@@ -1025,6 +1059,7 @@ class GDLQueue:
                     self.stats.add_completion(
                         url, False, time.time() - start_time, worker_id
                     )
+                    self._maybe_notify_all_idle()
                     self.queued_urls.discard(url)
                     self._record_failed_download(url, active_dir)
 
@@ -1067,6 +1102,7 @@ class InteractiveQueue(cmd.Cmd):
         "tail": "worker",
         "feed": "worker",
         "wd": "workerdir",
+        "workdir": "workerdir",
         "dir": "workerdir",
         "hist": "history",
         "recent": "history",
@@ -1112,13 +1148,15 @@ class InteractiveQueue(cmd.Cmd):
         self.status_thread: Optional[threading.Thread] = None
         self.worker_dir_overrides: Dict[int, Optional[Path]] = {}
         self.session_url_directory: Optional[Path] = None
-        self.async_messages: "queue.Queue[str]" = queue.Queue()
+        self.async_messages: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._async_printer_thread: Optional[threading.Thread] = None
         self.failed_offline: Dict[str, FailedEntry] = {}
         self.auto_start_ready = threading.Event()
         self.auto_start_done = threading.Event()
 
         # Load config if exists
         self._load_config()
+        self._start_async_printer()
         self._start_update_check()
         self._schedule_autostart()
 
@@ -1126,13 +1164,30 @@ class InteractiveQueue(cmd.Cmd):
     def _notify_async(self, message: str) -> None:
         self.async_messages.put(message)
 
-    def _drain_async_messages(self) -> None:
-        while True:
-            try:
-                message = self.async_messages.get_nowait()
-            except queue.Empty:
-                break
-            print(f"\n{message}" if message else "")
+    def _start_async_printer(self) -> None:
+        if self._async_printer_thread and self._async_printer_thread.is_alive():
+            return
+
+        def _printer_loop():
+            while True:
+                message = self.async_messages.get()
+                if message is None:
+                    break
+                print(f"\n{message}" if message else "")
+
+        self._async_printer_thread = threading.Thread(
+            target=_printer_loop,
+            name="async-printer",
+            daemon=True,
+        )
+        self._async_printer_thread.start()
+
+    def _stop_async_printer(self) -> None:
+        if not self._async_printer_thread:
+            return
+        self.async_messages.put(None)
+        self._async_printer_thread.join(timeout=1)
+        self._async_printer_thread = None
 
     def _start_update_check(self):
         def _runner():
@@ -1189,6 +1244,20 @@ class InteractiveQueue(cmd.Cmd):
     def _format_worker_dir(self, worker_id: int) -> str:
         directory = self._get_worker_dir(worker_id)
         return directory if directory else "(use global/default)"
+
+    def _format_free_space_label(self, path_obj: Path) -> Optional[str]:
+        try:
+            usage = shutil.disk_usage(path_obj)
+        except (OSError, ValueError):
+            return None
+        free_in_units = usage.free / (1024**3)
+        units = ["GB", "TB", "PB", "EB", "ZB"]
+        idx = 0
+        while free_in_units >= 1024 and idx < len(units) - 1:
+            free_in_units /= 1024
+            idx += 1
+        amount = f"{free_in_units:.1f}".replace(".", ",")
+        return f"{amount} {units[idx]} free space"
 
     def _get_worker_dir(self, worker_id: int) -> Optional[str]:
         if self.dlq and worker_id < self.dlq.next_worker_id:
@@ -1279,6 +1348,11 @@ class InteractiveQueue(cmd.Cmd):
                     self.config,
                     self.stats,
                     failed_seed=failed_seed,
+                )
+                self.dlq.set_idle_callback(
+                    lambda: self._notify_async(
+                        f"{Fore.CYAN}All workers completed their work and are idle again.{Style.RESET_ALL}"
+                    )
                 )
                 if self.failed_offline:
                     self.failed_offline.clear()
@@ -1498,7 +1572,6 @@ class InteractiveQueue(cmd.Cmd):
 
     # Commands -------------------------------------------------------------
     def precmd(self, line: str) -> str:
-        self._drain_async_messages()
         stripped = line.strip()
         if stripped:
             parts = stripped.split(None, 1)
@@ -1511,7 +1584,6 @@ class InteractiveQueue(cmd.Cmd):
 
     def postcmd(self, stop: bool, line: str) -> bool:
         stop = super().postcmd(stop, line)
-        self._drain_async_messages()
         return stop
 
     def default(self, line: str) -> bool:
@@ -2035,7 +2107,11 @@ class InteractiveQueue(cmd.Cmd):
                 path_obj = Path(path_input).expanduser()
                 path_obj.mkdir(parents=True, exist_ok=True)
                 self.session_url_directory = path_obj
-                print(f"{Fore.GREEN}Session default directory set to {path_obj}")
+                free_info = self._format_free_space_label(path_obj)
+                info_text = f" ({free_info})" if free_info else ""
+                print(
+                    f"{Fore.GREEN}Session default directory set to {path_obj}{info_text}"
+                )
             except Exception as exc:
                 print(f"{Fore.RED}Failed to set session default directory: {exc}")
             return False
@@ -2074,7 +2150,11 @@ class InteractiveQueue(cmd.Cmd):
             if directory_input is None:
                 msg = "(use global/default)"
             else:
-                msg = str(new_path)
+                msg = str(new_path) if new_path else directory_input
+                if new_path:
+                    free_info = self._format_free_space_label(new_path)
+                    if free_info:
+                        msg = f"{msg} ({free_info})"
 
             print(f"{Fore.GREEN}Worker {worker_id} directory set to: {msg}")
         except Exception as e:
@@ -2392,6 +2472,7 @@ class InteractiveQueue(cmd.Cmd):
             print("WAITING: Waiting for active downloads to complete...")
             self.dlq.shutdown()
 
+        self._stop_async_printer()
         print(f"{Fore.GREEN}COMPLETE: All downloads complete – goodbye!")
         return True
 
