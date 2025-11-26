@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import cmd
+import hashlib
 import itertools
 import json
 import os
@@ -62,6 +63,19 @@ DEFAULT_BINARY_NAME = (
 # Strip ANSI color codes so log pattern matching remains stable even when
 # gallery-dl writes colored output.
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+FILENAME_SAFE_PATTERN = re.compile(r"[^0-9A-Za-z._-]+")
+
+
+def _sanitize_filename(value: str, max_length: int = 120) -> str:
+    slug = FILENAME_SAFE_PATTERN.sub("_", value)
+    slug = re.sub(r"_+", "_", slug).strip("._")
+    if not slug:
+        slug = "url"
+    if len(slug) > max_length:
+        suffix = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
+        prefix_len = max(1, max_length - len(suffix) - 1)
+        slug = f"{slug[:prefix_len]}_{suffix}"
+    return slug
 
 
 def _strip_ansi(text: str) -> str:
@@ -229,6 +243,7 @@ class Config:
         self.flat_directories = True
         self.directory_template: Optional[str] = None
         self.keep_failed = True
+        self.dump_json = False
 
     def to_dict(self) -> dict:
         return {
@@ -246,6 +261,7 @@ class Config:
             "flat_directories": self.flat_directories,
             "directory_template": self.directory_template,
             "keep_failed": self.keep_failed,
+            "dump_json": self.dump_json,
         }
 
     def from_dict(self, data: dict):
@@ -658,6 +674,73 @@ class GDLQueue:
         with self.failed_downloads_lock:
             self.failed_downloads[url] = entry
 
+    def _dump_json_metadata(self, worker_id: int, url: str, target_dir: Path) -> None:
+        safe_name = _sanitize_filename(url)
+        json_path = target_dir / f"{safe_name}.json"
+        cmd = [self.exe] + self.config.default_args + ["-J", url]
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                timeout=300,
+            )
+        except Exception as exc:
+            self._record_worker_output(
+                worker_id,
+                f"[JSON] Failed to dump metadata for {url}: {exc}",
+            )
+            return
+
+        if result.returncode != 0:
+            stderr_snippet = (result.stderr or "").strip().splitlines()
+            detail = f" (stderr: {stderr_snippet[0][:200]})" if stderr_snippet else ""
+            self._record_worker_output(
+                worker_id,
+                f"[JSON] gallery-dl -J exited with {result.returncode}{detail}",
+            )
+            return
+
+        content = result.stdout
+        if not content.strip():
+            self._record_worker_output(
+                worker_id,
+                f"[JSON] No metadata returned for {url}",
+            )
+            return
+
+        existing_text: Optional[str] = None
+        if json_path.exists():
+            try:
+                existing_text = json_path.read_text(encoding="utf-8")
+            except Exception:
+                existing_text = None
+
+        if existing_text == content:
+            self._record_worker_output(
+                worker_id,
+                f"[JSON] Metadata unchanged for {json_path.name}",
+            )
+            return
+
+        try:
+            json_path.write_text(content, encoding="utf-8")
+            if existing_text is None:
+                status = "written"
+            else:
+                status = "updated"
+            self._record_worker_output(
+                worker_id,
+                f"[JSON] Metadata {status}: {json_path}",
+            )
+        except Exception as exc:
+            self._record_worker_output(
+                worker_id,
+                f"[JSON] Failed writing metadata to {json_path}: {exc}",
+            )
+
     def _clear_failed_download(self, url: str) -> None:
         with self.failed_downloads_lock:
             self.failed_downloads.pop(url, None)
@@ -871,6 +954,9 @@ class GDLQueue:
                     worker_id,
                     f"[INFO] Using download base directory: {active_dir}",
                 )
+
+                if self.config.dump_json:
+                    self._dump_json_metadata(worker_id, url, active_dir)
 
                 # Track current download with resolved directory
                 self.stats.set_current_download(worker_id, url, active_dir)
@@ -1123,9 +1209,13 @@ class InteractiveQueue(cmd.Cmd):
         "rm": "remove",
         "del": "remove",
         "delete": "remove",
-        "cls": "clear",
-        "flush": "clear",
-        "reset": "clear",
+        "clear": "cls",
+        "cls": "cls",
+        "clq": "clearqueue",
+        "clearqueue": "clearqueue",
+        "clear-queue": "clearqueue",
+        "flush": "clearqueue",
+        "reset": "clearqueue",
         "exit": "quit",
         "q": "quit",
         "x": "quit",
@@ -1413,9 +1503,6 @@ class InteractiveQueue(cmd.Cmd):
                 try:
                     self.auto_start_done.set()
                     self.do_start("")
-                    self._notify_async(
-                        f"{Fore.GREEN}AUTO-START: Workers started automatically after 5s delay{Style.RESET_ALL}"
-                    )
                 except Exception as exc:
                     self.auto_start_done.clear()
                     self._notify_async(
@@ -1617,7 +1704,9 @@ class InteractiveQueue(cmd.Cmd):
                 self.pending.append(PendingEntry(url, directory_override))
                 self._signal_auto_start_ready()
                 dir_msg = f" (dir: {directory_override})" if directory_override else ""
-                print(f"{Fore.YELLOW}PENDING: Added to pending: {url}{dir_msg}")
+                print(
+                    f"{Fore.WHITE}PENDING: Added to pending: {url}{dir_msg}{Style.RESET_ALL}"
+                )
                 added_now = True
             else:
                 print(f"{Fore.YELLOW}WARNING: Already in pending: {url}")
@@ -1633,7 +1722,10 @@ class InteractiveQueue(cmd.Cmd):
 
         if added_now and self.dlq is None:
             print(
-                f"{Fore.YELLOW}PENDING: URL added. Use 'start' to begin downloading.{Style.RESET_ALL}"
+                f"{Fore.WHITE}AUTO-START: Workers will start automatically after 5s delay{Style.RESET_ALL}"
+            )
+            print(
+                f"{Fore.WHITE}PENDING: URL added. Use 'start' to begin downloading.{Style.RESET_ALL}"
             )
 
         return False
@@ -2445,7 +2537,7 @@ class InteractiveQueue(cmd.Cmd):
 
         return False
 
-    def do_clear(self, arg: str) -> bool:
+    def do_clearqueue(self, arg: str) -> bool:
         """Clear pending list."""
         if self.dlq:
             print(f"{Fore.RED}Cannot clear - workers already running")
@@ -2459,6 +2551,16 @@ class InteractiveQueue(cmd.Cmd):
 
         self.pending.clear()
         print(f"{Fore.GREEN}CLEARED: Cleared {count} pending URLs")
+        return False
+
+    def do_cls(self, arg: str) -> bool:
+        """Clear the terminal output and reprint the header."""
+        command = "cls" if os.name == "nt" else "clear"
+        try:
+            os.system(command)
+        except Exception:
+            print("\n" * 50)
+        print(self.intro)
         return False
 
     def do_quit(self, arg: str) -> bool:
@@ -2492,13 +2594,14 @@ class InteractiveQueue(cmd.Cmd):
     start                  Start/resume workers (aliases: run, go, begin)
     pause                  Pause all workers (aliases: hold, stop)
     resume                 Resume workers or reload last session (aliases: continue, unpause)
+    cls                    Clear the terminal display (aliases: clear)
     quit                   Shutdown and exit (aliases: exit, q, x)
 
 {Fore.YELLOW}Queue Management:{Style.RESET_ALL}
     pending                Show pending URLs (aliases: queue, pend, list)
     urls                   Show all tracked URLs and their status (aliases: links, all)
     remove <index|url>     Remove from pending (aliases: rm, del, delete)
-    clear                  Clear pending list (aliases: cls, flush)
+    clearqueue             Clear pending list (aliases: clq, clear-queue, flush, reset)
     retry                  Re-queue all failed downloads (aliases: redo, rerun)
   
 {Fore.YELLOW}Monitoring:{Style.RESET_ALL}
@@ -2511,7 +2614,7 @@ class InteractiveQueue(cmd.Cmd):
     config                 Show all settings (aliases: cfg, conf, settings)
     config <key>           Show specific setting
     config <key> <value>   Set configuration value (e.g. config auto_status true)
-                           Useful keys: keep_failed, flat_directories, directory_template
+                           Useful keys: keep_failed, flat_directories, directory_template, dump_json
   
 {Fore.YELLOW}Session Management:{Style.RESET_ALL}
     save [file]            Save current session (aliases: sv, write, export)
