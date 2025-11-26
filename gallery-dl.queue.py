@@ -1234,6 +1234,7 @@ class InteractiveQueue(cmd.Cmd):
         self.stats = DownloadStats()
         self.pending: List[PendingEntry] = []
         self.all_urls: Set[str] = set()  # Track all URLs ever added
+        self.url_directory_overrides: Dict[str, Optional[str]] = {}
         self.dlq: Optional[GDLQueue] = None
         self.status_thread: Optional[threading.Thread] = None
         self.worker_dir_overrides: Dict[int, Optional[Path]] = {}
@@ -1333,7 +1334,36 @@ class InteractiveQueue(cmd.Cmd):
 
     def _format_worker_dir(self, worker_id: int) -> str:
         directory = self._get_worker_dir(worker_id)
-        return directory if directory else "(use global/default)"
+        return self._format_directory_label(directory)
+
+    def _format_directory_label(self, directory: Optional[Path | str]) -> str:
+        if not directory:
+            return "(use global/default)"
+
+        directory_path: Optional[Path]
+        try:
+            directory_path = Path(directory).expanduser()
+        except Exception:
+            directory_path = None
+
+        free_info = ""
+        if directory_path:
+            free_label = self._format_free_space_label(directory_path)
+            if free_label:
+                free_info = f" ({free_label})"
+        directory_str = str(directory)
+        return f"{directory_str}{free_info}"
+
+    def _remember_directory_for_url(
+        self, url: str, directory: Optional[Path | str]
+    ) -> None:
+        if directory:
+            self.url_directory_overrides[url] = str(directory)
+        else:
+            self.url_directory_overrides.pop(url, None)
+
+    def _forget_directory_for_url(self, url: str) -> None:
+        self.url_directory_overrides.pop(url, None)
 
     def _format_free_space_label(self, path_obj: Path) -> Optional[str]:
         try:
@@ -1526,6 +1556,7 @@ class InteractiveQueue(cmd.Cmd):
             self.all_urls = set()
             if not self.dlq:
                 self.worker_dir_overrides.clear()
+            self.url_directory_overrides.clear()
 
         for item in pending_payload:
             directory_path: Optional[Path] = None
@@ -1546,7 +1577,9 @@ class InteractiveQueue(cmd.Cmd):
             else:
                 url = str(item)
 
-            restored_entries.append(PendingEntry(url, directory_path))
+            restored_entry = PendingEntry(url, directory_path)
+            restored_entries.append(restored_entry)
+            self._remember_directory_for_url(url, directory_path)
 
         if merge:
             self.pending.extend(restored_entries)
@@ -1708,13 +1741,17 @@ class InteractiveQueue(cmd.Cmd):
                     f"{Fore.WHITE}PENDING: Added to pending: {url}{dir_msg}{Style.RESET_ALL}"
                 )
                 added_now = True
+                self._remember_directory_for_url(url, directory_override)
             else:
                 print(f"{Fore.YELLOW}WARNING: Already in pending: {url}")
         else:
             if self.dlq.add(url, directory_override):
                 dir_msg = f" (dir: {directory_override})" if directory_override else ""
-                print(f"{Fore.GREEN}QUEUED: Queued for download: {url}{dir_msg}")
+                print(
+                    f"{Fore.WHITE}QUEUED: Queued for download: {url}{dir_msg}{Style.RESET_ALL}"
+                )
                 added_now = True
+                self._remember_directory_for_url(url, directory_override)
             else:
                 print(
                     f"{Fore.YELLOW}WARNING: Duplicate URL (already queued/completed): {url}"
@@ -1846,6 +1883,7 @@ class InteractiveQueue(cmd.Cmd):
                 continue
             self.pending.append(PendingEntry(entry.url, entry.directory))
             self.all_urls.add(entry.url)
+            self._remember_directory_for_url(entry.url, entry.directory)
             added += 1
 
         self.failed_offline.clear()
@@ -1907,10 +1945,8 @@ class InteractiveQueue(cmd.Cmd):
             if self.worker_dir_overrides:
                 self._print_worker_dirs(label="Planned Worker Directories")
 
-        if self.session_url_directory:
-            print(f"Session default directory: {self.session_url_directory}")
-        else:
-            print("Session default directory: (use global/default)")
+        session_label = self._format_directory_label(self.session_url_directory)
+        print(f"Session default directory: {session_label}")
 
         print(f"\n{self.stats.get_summary()}")
         return False
@@ -2167,12 +2203,10 @@ class InteractiveQueue(cmd.Cmd):
             return text
 
         if not tokens:
-            label = "Worker Directories" if self.dlq else "Planned Worker Directories"
-            self._print_worker_dirs(label=label)
-            if self.session_url_directory:
-                print(f"Session default directory: {self.session_url_directory}")
-            else:
-                print("Session default directory: (use global/default)")
+            # label = "Worker Directories" if self.dlq else "Planned Worker Directories"
+            # self._print_worker_dirs(label=label)
+            session_label = self._format_directory_label(self.session_url_directory)
+            print(f"Session default directory: {session_label}")
             return False
 
         first_token = tokens[0]
@@ -2373,7 +2407,13 @@ class InteractiveQueue(cmd.Cmd):
             for url in self.all_urls:
                 if url not in completed_urls and url not in pending_urls_set:
                     urls_to_save.append(url)
-                    pending_payload.append(url)
+                    directory_override = self.url_directory_overrides.get(url)
+                    if directory_override:
+                        pending_payload.append(
+                            {"url": url, "directory": directory_override}
+                        )
+                    else:
+                        pending_payload.append(url)
 
         session_data = {
             "pending": pending_payload,
@@ -2423,6 +2463,16 @@ class InteractiveQueue(cmd.Cmd):
                 print(f"Saved {len(failed_entries)} failed downloads for future retry")
         except Exception as e:
             print(f"{Fore.RED}Failed to save session: {e}")
+
+        outstanding = set(urls_to_save)
+        if outstanding:
+            self.url_directory_overrides = {
+                url: directory
+                for url, directory in self.url_directory_overrides.items()
+                if directory and url in outstanding
+            }
+        else:
+            self.url_directory_overrides.clear()
 
         return False
 
@@ -2530,6 +2580,7 @@ class InteractiveQueue(cmd.Cmd):
         if removed:
             # Also remove from all_urls tracking if it was only pending
             self.all_urls.discard(removed.url)
+            self._forget_directory_for_url(removed.url)
             dir_msg = f" (dir: {removed.directory})" if removed.directory else ""
             print(f"{Fore.GREEN}REMOVED: Removed: {removed.url}{dir_msg}")
         else:
@@ -2548,6 +2599,7 @@ class InteractiveQueue(cmd.Cmd):
         # Remove pending URLs from all_urls tracking
         for entry in self.pending:
             self.all_urls.discard(entry.url)
+            self._forget_directory_for_url(entry.url)
 
         self.pending.clear()
         print(f"{Fore.GREEN}CLEARED: Cleared {count} pending URLs")
