@@ -61,74 +61,70 @@ Press `Ctrl+C` while inside `worker`/`worker all` views to return to the main pr
 
 ## Session Files
 
-Session files are JSON (`.json` or `.conf`). Current saves use the human-readable **format v3**.
+Session files are JSON formatted.
 
 - URLs are stored grouped by path in a human-readable map. Example key: `pending_by_path`.
 - Shape: `<path> -> { "1": "<url>", "2": "<url>" }`
 - `""` (empty string) is used for “no directory / default”.
 
-Writes are **atomic** and skipped when the JSON payload is unchanged.
-
-`load` remains backward compatible with older session files (v1/v2 compatibility layer). Format v3 has been removed.
-
 ## Command Aliases
 
 Full list of aliases (alias → canonical command):
 
-| Alias | Command |
-| --- | --- |
-| `run` | `start` |
-| `go` | `start` |
-| `begin` | `start` |
-| `hold` | `pause` |
-| `stop` | `pause` |
-| `continue` | `resume` |
-| `unpause` | `resume` |
-| `reload` | `resume` |
-| `recover` | `resume` |
-| `resume-session` | `resume` |
-| `stat` | `status` |
-| `info` | `status` |
-| `log` | `worker` |
-| `tail` | `worker` |
-| `feed` | `worker` |
-| `workers` | `worker` |
-| `wd` | `workerdir` |
-| `workdir` | `workerdir` |
-| `dir` | `workerdir` |
-| `hist` | `history` |
-| `recent` | `history` |
-| `cfg` | `config` |
-| `conf` | `config` |
-| `settings` | `config` |
-| `sv` | `save` |
-| `write` | `save` |
-| `export` | `save` |
-| `ld` | `load` |
-| `restore` | `load` |
-| `open` | `load` |
-| `queue` | `pending` |
-| `pend` | `pending` |
-| `list` | `pending` |
-| `links` | `urls` |
-| `all` | `urls` |
-| `rm` | `remove` |
-| `del` | `remove` |
-| `delete` | `remove` |
-| `clear` | `cls` |
-| `cls` | `cls` |
-| `clq` | `clearqueue` |
-| `clearqueue` | `clearqueue` |
-| `clear-queue` | `clearqueue` |
-| `flush` | `clearqueue` |
-| `reset` | `clearqueue` |
-| `exit` | `quit` |
-| `q` | `quit` |
-| `x` | `quit` |
-| `redo` | `retry` |
-| `rerun` | `retry` |
-| `retry-all` | `retry` |
-| `replay` | `retry` |
-| `retryall` | `retryall` |
-| `clip` | `clipboard` |
-| `cb` | `clipboard` |
+| Alias | Command | What it does |
+| --- | --- | --- |
+| `run` | `start` | Start workers and begin downloading |
+| `go` | `start` | |
+| `begin` | `start` | |
+| `hold` | `pause` | Pause all workers |
+| `stop` | `pause` | |
+| `continue` | `resume` | Resume workers or reload last session when idle |
+| `unpause` | `resume` | |
+| `reload` | `resume` | |
+| `recover` | `resume` | |
+| `resume-session` | `resume` | |
+| `stat` | `status` | Show detailed status report |
+| `info` | `status` | |
+| `log` | `worker` | Follow live stdout/stderr for a worker |
+| `tail` | `worker` | |
+| `feed` | `worker` | |
+| `workers` | `worker` | |
+| `wd` | `workerdir` | Set session default directory (or optional per-worker dirs) |
+| `workdir` | `workerdir` | |
+| `dir` | `workerdir` | |
+| `hist` | `history` | Show recent download history |
+| `recent` | `history` | |
+| `cfg` | `config` | View or change configuration |
+| `conf` | `config` | |
+| `settings` | `config` | |
+| `sv` | `save` | Save session to file |
+| `write` | `save` | |
+| `export` | `save` | |
+| `ld` | `load` | Load session from file |
+| `restore` | `load` | |
+| `open` | `load` | |
+| `queue` | `pending` | List pending URLs |
+| `pend` | `pending` | |
+| `list` | `pending` | |
+| `links` | `urls` | Show all tracked URLs |
+| `all` | `urls` | |
+| `rm` | `remove` | Remove a URL from pending |
+| `del` | `remove` | |
+| `delete` | `remove` | |
+| `clear` | `cls` | Clear the terminal display |
+| `cls` | `cls` | |
+| `clq` | `clearqueue` | Clear pending queue |
+| `clearqueue` | `clearqueue` | |
+| `clear-queue` | `clearqueue` | |
+| `flush` | `clearqueue` | |
+| `reset` | `clearqueue` | |
+| `exit` | `quit` | Exit the shell |
+| `q` | `quit` | |
+| `x` | `quit` | |
+| `redo` | `retry` | Re-queue only failed downloads |
+| `rerun` | `retry` | |
+| `retry-all` | `retry` | |
+| `replay` | `retry` | |
+| `retryall` | `retryall` | Re-queue all completed URLs |
+| `clip` | `clipboard` | Toggle clipboard auto-ingest |
+| `cb` | `clipboard` | |
