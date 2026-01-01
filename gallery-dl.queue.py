@@ -121,11 +121,11 @@ HTTP_429_WEIGHT = 10
 
 # If the weighted 5xx counter reaches this threshold within a worker, the
 # current URL is considered failed and is reappended.
-HTTP_5XX_FAIL_THRESHOLD = 10
+HTTP_5XX_FAIL_THRESHOLD = 5
 
 # Exponential backoff for HTTP 429 Too Many Requests (per worker thread).
 RATE_LIMIT_BACKOFF_BASE_SECONDS = 30
-RATE_LIMIT_BACKOFF_MAX_SECONDS = 60 * 60
+RATE_LIMIT_BACKOFF_MAX_SECONDS = 5 * 60
 
 
 def _format_bytes(num_bytes: float) -> str:
@@ -3015,7 +3015,7 @@ class InteractiveQueue(cmd.Cmd):
                             pass
                 self.dlq.set_idle_callback(
                     lambda: self._notify_async(
-                        f"{Fore.CYAN}All workers completed their work and are idle again.{Style.RESET_ALL}"
+                        f"{Fore.CYAN}All workers are idle again.{Style.RESET_ALL}"
                     )
                 )
                 if self.failed_offline:
@@ -3511,7 +3511,7 @@ class InteractiveQueue(cmd.Cmd):
                     f"{Fore.WHITE}AUTO-START: Workers will start automatically after 5s delay{Style.RESET_ALL}"
                 )
                 print(
-                    f"{Fore.WHITE}PENDING: URL added. Use 'start' to begin downloading.{Style.RESET_ALL}"
+                    f"{Fore.WHITE}PENDING: URL added. Use 'start' to begin downloading, or wait for auto-start.{Style.RESET_ALL}"
                 )
 
         return added_now
@@ -3683,8 +3683,9 @@ class InteractiveQueue(cmd.Cmd):
             if skipped:
                 print(f"{Fore.YELLOW}Skipped {skipped} already-pending URLs")
             print(
-                f"{Fore.CYAN}Use 'start' to process the retried downloads{Style.RESET_ALL}"
+                f"{Fore.CYAN}Use 'start' to process the retried downloads or wait for auto-start{Style.RESET_ALL}"
             )
+            self._signal_auto_start_ready()
         else:
             print(f"{Fore.CYAN}No failed downloads were ready for retry")
 
@@ -3758,7 +3759,7 @@ class InteractiveQueue(cmd.Cmd):
             if self.dlq and self.dlq.is_paused():
                 print(f"{Fore.YELLOW}Workers are paused, use 'resume' to continue processing")
             if not self.dlq:
-                print(f"{Fore.CYAN}Use 'start' to process the retried downloads{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}Use 'start' to process the retried downloads or wait for auto-start{Style.RESET_ALL}")
                 self._signal_auto_start_ready()
         else:
             print(f"{Fore.CYAN}No completed downloads were ready for retry")
