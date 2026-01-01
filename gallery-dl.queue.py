@@ -94,6 +94,9 @@ DEFAULT_BINARY_NAME = (
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 FILENAME_SAFE_PATTERN = re.compile(r"[^0-9A-Za-z._-]+")
 
+# Console title suffix (must appear at the end of the title).
+APP_TITLE_SUFFIX = "g-dlQ v2.1"
+
 # ---------------------------------------------------------------------------
 # Tiny-video detection (known-bad placeholder downloads)
 #
@@ -154,6 +157,38 @@ def _sanitize_filename(value: str, max_length: int = 120) -> str:
 
 def _strip_ansi(text: str) -> str:
     return ANSI_ESCAPE_RE.sub("", text)
+
+
+def _sanitize_console_title(value: str, *, max_len: int = 240) -> str:
+    text = (value or "").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text
+
+
+def _set_console_title(title: str) -> None:
+    """Best-effort console title update.
+
+    - Windows: uses SetConsoleTitleW, falls back to `title`.
+    - Other: uses ANSI OSC 0 sequence.
+    """
+    safe = _sanitize_console_title(title)
+    if not safe:
+        return
+
+    if sys.platform.startswith("win"):
+        try:
+            os.system(f"title {safe}")
+        except Exception:
+            pass
+        return
+
+    try:
+        sys.stdout.write(f"\33]0;{safe}\a")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 def _write_json_atomic_if_changed(path: str | Path, payload: object) -> bool:
@@ -337,7 +372,8 @@ class Config:
         self.default_args = []
         self.auto_save = True
         self.session_file = "gallery_dl_session.json"
-        self.config_file = "gallery_dl_config.json"
+        # Configuration file for this queue app (stored in the current directory).
+        self.config_file = "gallery_dl_queue_config.json"
         self.auto_status = False
         self.flat_directories = True
         self.directory_template: Optional[str] = None
@@ -371,6 +407,7 @@ class Config:
             "default_args": self.default_args,
             "auto_save": self.auto_save,
             "session_file": self.session_file,
+            "config_file": self.config_file,
             "auto_status": self.auto_status,
             "flat_directories": self.flat_directories,
             "directory_template": self.directory_template,
@@ -576,6 +613,15 @@ class DownloadStats:
     def history_snapshot(self) -> List[dict]:
         with self._lock:
             return list(self.history)
+
+    def snapshot_counters(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "completed": int(self.completed),
+                "failed": int(self.failed),
+                "retried": int(self.retried),
+                "reappended": int(self.reappended),
+            }
 
     def get_summary(self) -> str:
         with self._lock:
@@ -2403,6 +2449,11 @@ class InteractiveQueue(cmd.Cmd):
         self.auto_start_ready = threading.Event()
         self.auto_start_done = threading.Event()
 
+        # Console title updates (best-effort)
+        self._title_stop_event = threading.Event()
+        self._title_thread: Optional[threading.Thread] = None
+        self._last_console_title: str = ""
+
         # Clipboard ingest automation
         self.clipboard_enabled = False
         self.clipboard_armed = False
@@ -2415,6 +2466,7 @@ class InteractiveQueue(cmd.Cmd):
         # Load config if exists
         self._load_config()
         self._start_async_printer()
+        self._start_title_updater()
 
         if not HAS_READLINE:
             # Without a readline-compatible module, cmd's tab completion won't work.
@@ -2425,6 +2477,92 @@ class InteractiveQueue(cmd.Cmd):
 
         self._start_update_check()
         self._schedule_autostart()
+
+    def _compose_console_title(self) -> str:
+        counters = {}
+        try:
+            counters = self.stats.snapshot_counters()
+        except Exception:
+            counters = {"completed": 0, "failed": 0, "retried": 0, "reappended": 0}
+
+        active = 0
+        queued = 0
+        try:
+            if self.dlq:
+                active = len(self.dlq.get_active_downloads())
+                queued = int(self.dlq.get_queue_size())
+            else:
+                queued = int(len(self.pending))
+        except Exception:
+            pass
+
+        parts = [
+            f"A:{active}",
+            f"Q:{queued}",
+            f"OK:{int(counters.get('completed', 0))}",
+            f"F:{int(counters.get('failed', 0))}",
+            f"RA:{int(counters.get('reappended', 0))}",
+        ]
+        return " ".join(parts) + f" - {APP_TITLE_SUFFIX}"
+
+    def _update_console_title(self) -> None:
+        title = self._compose_console_title()
+        if title == self._last_console_title:
+            return
+        self._last_console_title = title
+        _set_console_title(title)
+
+    def _start_title_updater(self) -> None:
+        if self._title_thread and self._title_thread.is_alive():
+            return
+
+        self._title_stop_event.clear()
+
+        def _loop() -> None:
+            while not self._title_stop_event.is_set():
+                try:
+                    self._update_console_title()
+                except Exception:
+                    pass
+                try:
+                    self._title_stop_event.wait(timeout=2.0)
+                except Exception:
+                    time.sleep(2.0)
+
+        self._title_thread = threading.Thread(
+            target=_loop,
+            name="console-title",
+            daemon=True,
+        )
+        self._title_thread.start()
+
+    def _stop_title_updater(self) -> None:
+        self._title_stop_event.set()
+        if self._title_thread and self._title_thread.is_alive():
+            self._title_thread.join(timeout=1)
+        self._title_thread = None
+
+    def _apply_pending_worker_dir_overrides(self) -> None:
+        """Apply any stored worker dir overrides to existing workers.
+
+        Keeps overrides for worker ids that do not exist yet (for future upsizing).
+        """
+        if not self.dlq or not self.worker_dir_overrides:
+            return
+
+        applied: List[int] = []
+        max_worker_id = getattr(self.dlq, "next_worker_id", 0) or 0
+        for worker_id, path in list(self.worker_dir_overrides.items()):
+            if max_worker_id and worker_id >= max_worker_id:
+                continue
+            try:
+                self.dlq.set_worker_download_dir(worker_id, str(path) if path else None)
+                applied.append(worker_id)
+            except Exception as exc:
+                print(f"{Fore.YELLOW}Note: Could not assign worker {worker_id} directory: {exc}")
+
+        for worker_id in applied:
+            self.worker_dir_overrides.pop(worker_id, None)
 
     # Clipboard ingest -------------------------------------------------
     def _read_clipboard_text(self) -> Optional[str]:
@@ -2471,7 +2609,8 @@ class InteractiveQueue(cmd.Cmd):
             text = text[1:-1].strip()
 
         # Trim trailing punctuation that often appears when copying from chat.
-        text = text.rstrip(")]}>,.\"'\n\r\t")
+        # Include a few common Unicode quote/prime variants we have seen in the wild.
+        text = text.rstrip(")]}>,.\"'\n\r\t`´¸·«»‘’“”")
 
         # Basic sanity: no embedded whitespace/control chars.
         if any(ch.isspace() for ch in text):
@@ -2931,7 +3070,13 @@ class InteractiveQueue(cmd.Cmd):
         return self._normalize_url(url) is not None
 
     def _config_file(self) -> Path:
-        return Path("gallery_dl_queue_config.json")
+        try:
+            name = Path(str(getattr(self.config, "config_file", "") or "")).name
+        except Exception:
+            name = ""
+        if not name:
+            name = "gallery_dl_queue_config.json"
+        return Path(name)
 
     def _config_backup_file(self) -> Path:
         config_file = self._config_file()
@@ -3209,6 +3354,9 @@ class InteractiveQueue(cmd.Cmd):
         pending_payload = session_data.get("pending", []) or []
         restored_entries: List[PendingEntry] = []
 
+        normalized_changed = 0
+        normalized_dropped = 0
+
         if not merge:
             self.pending = []
             self.all_urls = set()
@@ -3231,9 +3379,17 @@ class InteractiveQueue(cmd.Cmd):
             else:
                 url = str(item)
 
-            restored_entry = PendingEntry(url, directory_path)
+            raw_url = str(url)
+            norm_url = self._normalize_url(raw_url)
+            if not norm_url:
+                normalized_dropped += 1
+                continue
+            if norm_url != raw_url:
+                normalized_changed += 1
+
+            restored_entry = PendingEntry(norm_url, directory_path)
             restored_entries.append(restored_entry)
-            self._remember_directory_for_url(url, directory_path)
+            self._remember_directory_for_url(norm_url, directory_path)
 
         if merge:
             self.pending.extend(restored_entries)
@@ -3245,7 +3401,18 @@ class InteractiveQueue(cmd.Cmd):
         # Restore broader URL tracking and per-URL directory overrides (for retryall etc.).
         all_urls_payload = session_data.get("all_urls")
         if isinstance(all_urls_payload, list):
-            urls_from_payload = {str(u) for u in all_urls_payload if u}
+            urls_from_payload: Set[str] = set()
+            for u in all_urls_payload:
+                if not u:
+                    continue
+                raw = str(u)
+                norm = self._normalize_url(raw)
+                if not norm:
+                    normalized_dropped += 1
+                    continue
+                if norm != raw:
+                    normalized_changed += 1
+                urls_from_payload.add(norm)
             if merge:
                 self.all_urls.update(urls_from_payload)
             else:
@@ -3256,15 +3423,33 @@ class InteractiveQueue(cmd.Cmd):
             for url, directory in overrides_payload.items():
                 if not url:
                     continue
+                raw_url = str(url)
+                norm_url = self._normalize_url(raw_url)
+                if not norm_url:
+                    normalized_dropped += 1
+                    continue
+                if norm_url != raw_url:
+                    normalized_changed += 1
                 if directory:
-                    self.url_directory_overrides[str(url)] = str(directory)
+                    self.url_directory_overrides[norm_url] = str(directory)
                 else:
-                    self.url_directory_overrides.pop(str(url), None)
+                    self.url_directory_overrides.pop(norm_url, None)
 
         completed_payload = session_data.get("completed")
         loaded_completed_urls: Optional[Set[str]] = None
         if isinstance(completed_payload, list):
-            loaded_completed_urls = {str(u) for u in completed_payload if u}
+            loaded_completed_urls = set()
+            for u in completed_payload:
+                if not u:
+                    continue
+                raw = str(u)
+                norm = self._normalize_url(raw)
+                if not norm:
+                    normalized_dropped += 1
+                    continue
+                if norm != raw:
+                    normalized_changed += 1
+                loaded_completed_urls.add(norm)
             self.all_urls.update(loaded_completed_urls)
             if self.dlq:
                 if not merge:
@@ -3274,6 +3459,12 @@ class InteractiveQueue(cmd.Cmd):
                 if not merge:
                     self.completed_offline.clear()
                 self.completed_offline.update(loaded_completed_urls)
+
+        if normalized_changed or normalized_dropped:
+            msg = f"Note: Normalized {normalized_changed} URL(s)"
+            if normalized_dropped:
+                msg += f", dropped {normalized_dropped} invalid URL(s)"
+            print(f"{Fore.YELLOW}{msg}{Style.RESET_ALL}")
 
         if "config" in session_data:
             self.config.from_dict(session_data["config"])
@@ -3290,21 +3481,11 @@ class InteractiveQueue(cmd.Cmd):
 
         worker_dirs_data = session_data.get("worker_directories")
         if worker_dirs_data is not None:
-            # Only restore worker directory slots that fit the current worker count.
-            # This prevents errors when older sessions contain more workers than
-            # the current configuration (e.g. after downsizing 8 -> 4 workers).
-            try:
-                worker_limit = int(getattr(self.config, "workers", 0) or 0)
-            except Exception:
-                worker_limit = 0
             target_dirs: Dict[int, Optional[Path]] = {}
             for worker_id_str, directory_value in worker_dirs_data.items():
                 try:
                     worker_id = int(worker_id_str)
                 except (TypeError, ValueError):
-                    continue
-
-                if worker_limit and worker_id >= worker_limit:
                     continue
 
                 directory_path = None
@@ -3319,9 +3500,13 @@ class InteractiveQueue(cmd.Cmd):
             if self.dlq:
                 for worker_id, path_obj in target_dirs.items():
                     try:
-                        self.dlq.set_worker_download_dir(
-                            worker_id, str(path_obj) if path_obj else None
-                        )
+                        if worker_id >= self.dlq.next_worker_id:
+                            # Keep for future upsizing.
+                            self.worker_dir_overrides[worker_id] = path_obj
+                        else:
+                            self.dlq.set_worker_download_dir(
+                                worker_id, str(path_obj) if path_obj else None
+                            )
                     except Exception as exc:
                         print(
                             f"{Fore.YELLOW}Note: Could not assign worker {worker_id} directory while loading: {exc}"
@@ -3561,19 +3746,8 @@ class InteractiveQueue(cmd.Cmd):
             self.dlq.resume()
             print(f"{Fore.GREEN}RESUMED: Resumed workers")
 
-        # Add pending URLs and track them
-        if self.worker_dir_overrides:
-            max_worker_id = getattr(self.dlq, "next_worker_id", 0) or 0
-            for worker_id, path in list(self.worker_dir_overrides.items()):
-                if max_worker_id and worker_id >= max_worker_id:
-                    continue
-                try:
-                    self.dlq.set_worker_download_dir(
-                        worker_id, str(path) if path else None
-                    )
-                except Exception as e:
-                    print(f"{Fore.RED}Failed to set worker {worker_id} directory: {e}")
-            self.worker_dir_overrides.clear()
+        # Apply any stored per-worker directory overrides (including ones planned for future workers).
+        self._apply_pending_worker_dir_overrides()
 
         added = 0
         for entry in list(self.pending):
@@ -4143,11 +4317,22 @@ class InteractiveQueue(cmd.Cmd):
         try:
             if self.dlq:
                 if worker_id >= self.dlq.next_worker_id:
-                    print(
-                        f"{Fore.RED}Worker {worker_id} does not exist (currently {self.dlq.next_worker_id} workers)"
+                    # Allow planning directories for future workers (after upsizing).
+                    new_path = (
+                        self._expanduser_mkdir(
+                            directory_input,
+                            fail_prefix="Failed to set directory",
+                            color=Fore.RED,
+                        )
+                        if directory_input
+                        else None
                     )
-                    return False
-                new_path = self.dlq.set_worker_download_dir(worker_id, directory_input)
+                    self.worker_dir_overrides[worker_id] = new_path
+                    print(
+                        f"{Fore.YELLOW}Planned: Worker {worker_id} does not exist yet. Directory will be applied when workers are increased.{Style.RESET_ALL}"
+                    )
+                else:
+                    new_path = self.dlq.set_worker_download_dir(worker_id, directory_input)
             else:
                 new_path = (
                     self._expanduser_mkdir(
@@ -4257,6 +4442,7 @@ class InteractiveQueue(cmd.Cmd):
                                 print(
                                     f"{Fore.YELLOW}WORKERS: Upsizing {old_count} -> {new_count}. New workers started immediately."
                                 )
+                                self._apply_pending_worker_dir_overrides()
                         except Exception as exc:
                             print(f"{Fore.RED}Failed to resize workers: {exc}")
                     elif key == "auto_status" and self.config.auto_status and self.dlq:
@@ -4570,6 +4756,7 @@ class InteractiveQueue(cmd.Cmd):
         """Quit the application."""
         print("SHUTTING DOWN...")
 
+        self._stop_title_updater()
         self._stop_clipboard_monitor()
 
         if self.config.auto_save and (self.pending or self.dlq):
@@ -4683,6 +4870,11 @@ Inside the shell:
         print(
             f"\n{Fore.YELLOW}Interrupted - stopping workers and exiting...{Style.RESET_ALL}"
         )
+        try:
+            app._stop_title_updater()
+        except Exception:
+            pass
+
         try:
             app._stop_clipboard_monitor()
         except Exception:
