@@ -95,7 +95,7 @@ ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 FILENAME_SAFE_PATTERN = re.compile(r"[^0-9A-Za-z._-]+")
 
 # Console title suffix (must appear at the end of the title).
-APP_TITLE_SUFFIX = "g-dlQ v2.1"
+APP_TITLE_SUFFIX = "g-dlQ v2.2"
 
 # ---------------------------------------------------------------------------
 # Tiny-video detection (known-bad placeholder downloads)
@@ -2473,7 +2473,7 @@ class GDLQueue:
                             )
                             print(
                                 f"{Fore.YELLOW}WARNING: Worker {worker_id}: Retrying {url} "
-                                f"(attempt {attempt}/{self.config.max_retries})"
+                                f"(attempt {attempt}/{self.config.max_retries}){Style.RESET_ALL}"
                             )
                             time.sleep(self.config.retry_delay)
                             self.q.put((url, attempt, url_directory))
@@ -2487,7 +2487,6 @@ class GDLQueue:
                     else:
                         duration = time.time() - start_time
                         self.stats.add_completion(url, success, duration, worker_id)
-                        self._maybe_notify_all_idle()
 
                         if success:
                             self._clear_unsupported(url)
@@ -2501,7 +2500,7 @@ class GDLQueue:
                             )
                             print(
                                 f"{Fore.GREEN}SUCCESS: Worker {worker_id}: Completed {url} "
-                                f"({duration:.1f}s)"
+                                f"({duration:.1f}s){Style.RESET_ALL}"
                             )
                             if self.on_url_completed:
                                 try:
@@ -2546,6 +2545,10 @@ class GDLQueue:
                             with self._url_lock:
                                 self.queued_urls.discard(url)
                             self._record_failed_download(url, active_dir)
+
+                        # Notify idle AFTER printing success/fail so the
+                        # idle message does not interleave with the result.
+                        self._maybe_notify_all_idle()
 
                 except Exception as e:
                     if proc and proc.poll() is None:
@@ -2650,7 +2653,7 @@ class InteractiveQueue(cmd.Cmd):
         "automode": "auto",
     }
 
-    intro = f"{Fore.CYAN}gallery-dl Queue v2.1{Style.RESET_ALL} – type {Fore.YELLOW}?{Style.RESET_ALL} for help"
+    intro = f"{Fore.CYAN}gallery-dl Queue v2.2{Style.RESET_ALL} – type {Fore.YELLOW}?{Style.RESET_ALL} for help"
     prompt = f"{Fore.GREEN}> {Style.RESET_ALL}"
     completekey = "tab"
 
@@ -2665,6 +2668,7 @@ class InteractiveQueue(cmd.Cmd):
         self.status_thread: Optional[threading.Thread] = None
         self.worker_dir_overrides: Dict[int, Optional[Path]] = {}
         self.session_url_directory: Optional[Path] = None
+        self._af_probe_failures: Dict[str, int] = {}  # URL → consecutive probe failure count
         self.async_messages: "queue.Queue[Optional[str]]" = queue.Queue()
         self._async_printer_thread: Optional[threading.Thread] = None
         self._async_last_was_message = False
@@ -2697,6 +2701,9 @@ class InteractiveQueue(cmd.Cmd):
 
         # Temporary state persistence – crash recovery for added URLs.
         self._temp_state_lock = threading.Lock()
+        # Lock protecting self.pending across threads (main, clipboard-consumer,
+        # auto-start, console-title).
+        self._pending_lock = threading.Lock()
 
         # Load config if exists
         self._load_config()
@@ -2728,7 +2735,8 @@ class InteractiveQueue(cmd.Cmd):
                 active = len(self.dlq.get_active_downloads())
                 queued = int(self.dlq.get_queue_size())
             else:
-                queued = int(len(self.pending))
+                with self._pending_lock:
+                    queued = int(len(self.pending))
         except Exception:
             pass
 
@@ -2795,7 +2803,7 @@ class InteractiveQueue(cmd.Cmd):
                 self.dlq.set_worker_download_dir(worker_id, str(path) if path else None)
                 applied.append(worker_id)
             except Exception as exc:
-                print(f"{Fore.YELLOW}Note: Could not assign worker {worker_id} directory: {exc}")
+                print(f"{Fore.YELLOW}Note: Could not assign worker {worker_id} directory: {exc}{Style.RESET_ALL}")
 
         for worker_id in applied:
             self.worker_dir_overrides.pop(worker_id, None)
@@ -2885,20 +2893,70 @@ class InteractiveQueue(cmd.Cmd):
         return text
 
     def _extract_urls_from_text(self, text: str) -> List[str]:
+        """Extract URLs from arbitrary text, including pasted link lists.
+
+        Two-phase approach:
+          Phase 1 – Regex extraction: find explicit ``http(s)://`` and ``www.``
+                    URLs embedded anywhere in the text (handles prose, HTML, etc.).
+          Phase 2 – Line-based splitting: when the text contains multiple lines,
+                    each line is also tried individually after stripping common
+                    list markers (``-``, ``•``, ``*``, ``>``, numbered prefixes)
+                    and splitting on ``,``, ``;``, ``|``, tab characters.  Each
+                    fragment is fed through ``_normalize_url`` which already
+                    handles bare domains, wrapper chars, and trailing punctuation.
+
+        Duplicates are suppressed while preserving first-seen order.
+        """
         if not text:
             return []
-        # Keep this simple and robust; find http(s) URLs (and www.*) and trim common trailing punctuation.
+
+        seen: set = set()
+        result: List[str] = []
+
+        def _add(url: str) -> None:
+            if url not in seen:
+                seen.add(url)
+                result.append(url)
+
+        # -- Phase 1: regex extraction (explicit URLs) -----------------------
         raw = re.findall(
             r"(?:https?://|www\.)[^\s<>\"']+",
             text,
             flags=re.IGNORECASE,
         )
-        cleaned: List[str] = []
         for url in raw:
             normalized = self._normalize_url(url)
             if normalized:
-                cleaned.append(normalized)
-        return cleaned
+                _add(normalized)
+
+        # -- Phase 2: line-based / delimited splitting -----------------------
+        # Only when the text contains at least one newline (multi-line paste).
+        if "\n" in text or "\r" in text:
+            # Strip common list markers: bullets, numbers, arrows, etc.
+            _LIST_MARKER_RE = re.compile(
+                r"^[\s\-\u2022\u2023\u25E6\u2043*>»\u2019]+|"   # leading bullets / arrows
+                r"^\d{1,4}[.):\]]\s*",                            # numbered list prefix
+                flags=re.UNICODE,
+            )
+            for line in re.split(r"[\r\n]+", text):
+                line = line.strip()
+                if not line:
+                    continue
+                # Strip list marker prefix.
+                line = _LIST_MARKER_RE.sub("", line).strip()
+                if not line:
+                    continue
+                # Split on common inline delimiters.
+                fragments = re.split(r"[,;|\t]+", line)
+                for frag in fragments:
+                    frag = frag.strip()
+                    if not frag:
+                        continue
+                    normalized = self._normalize_url(frag)
+                    if normalized:
+                        _add(normalized)
+
+        return result
 
     def _fetch_remote_folder_name(self, url: str, *, quiet: bool = False) -> Optional[str]:
         """Probe gallery-dl metadata for a URL and derive a folder name.
@@ -2934,7 +2992,7 @@ class InteractiveQueue(cmd.Cmd):
                 stderr=subprocess.PIPE,
                 text=True,
                 errors="replace",
-                timeout=60,
+                timeout=30,
             )
         except Exception as exc:
             _msg(
@@ -3035,14 +3093,20 @@ class InteractiveQueue(cmd.Cmd):
 
         def _watcher_loop() -> None:
             """Fast polling loop – only detects clipboard changes."""
+            consecutive_errors = 0
             while not self._clipboard_stop_event.is_set():
                 try:
                     text = self._read_clipboard_text()
                     if text and text != self._clipboard_last_text:
                         self._clipboard_last_text = text
                         self._clipboard_ingest_queue.put(text)
-                except Exception:
-                    pass
+                    consecutive_errors = 0
+                except Exception as exc:
+                    consecutive_errors += 1
+                    if consecutive_errors == 5:
+                        self._notify_async(
+                            f"{Fore.YELLOW}CLIPBOARD: Watcher hitting repeated errors: {exc}{Style.RESET_ALL}"
+                        )
                 try:
                     time.sleep(0.6)
                 except Exception:
@@ -3061,8 +3125,10 @@ class InteractiveQueue(cmd.Cmd):
                     break
                 try:
                     self._process_clipboard_text(text)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._notify_async(
+                        f"{Fore.YELLOW}CLIPBOARD: Error processing clipboard text: {exc}{Style.RESET_ALL}"
+                    )
 
         self._clipboard_thread = threading.Thread(
             target=_watcher_loop,
@@ -3087,6 +3153,8 @@ class InteractiveQueue(cmd.Cmd):
             self._clipboard_consumer_thread.join(timeout=3)
         self._clipboard_thread = None
         self._clipboard_consumer_thread = None
+        # Allow re-ingesting URLs on next enable cycle.
+        self._clipboard_seen_urls.clear()
 
     def _process_clipboard_text(self, text: str) -> None:
         if not self.clipboard_enabled:
@@ -3152,7 +3220,9 @@ class InteractiveQueue(cmd.Cmd):
                     completed = set(self.completed_offline)
 
                 # Pending entries (workers not started yet)
-                for pe in list(self.pending):
+                with self._pending_lock:
+                    pending_snapshot = list(self.pending)
+                for pe in pending_snapshot:
                     if pe.url not in completed:
                         entries.append({
                             "url": pe.url,
@@ -3161,7 +3231,7 @@ class InteractiveQueue(cmd.Cmd):
 
                 # URLs that are queued/active but not yet completed
                 if self.dlq:
-                    pending_urls = {pe.url for pe in self.pending}
+                    pending_urls = {pe.url for pe in pending_snapshot}
                     for url in sorted(self.all_urls):
                         if url not in completed and url not in pending_urls:
                             entries.append({
@@ -3599,6 +3669,11 @@ class InteractiveQueue(cmd.Cmd):
     def _save_config(self):
         """Save current configuration and update backup."""
         data = self.config.to_dict()
+        # Persist session_url_directory alongside config so it survives restarts
+        # without requiring an explicit 'save' command.
+        data["session_url_directory"] = (
+            str(self.session_url_directory) if self.session_url_directory else None
+        )
         config_file = self._config_file()
         backup_file = self._config_backup_file()
 
@@ -3606,14 +3681,14 @@ class InteractiveQueue(cmd.Cmd):
             with open(config_file, "w") as handle:
                 json.dump(data, handle, indent=2)
         except Exception as exc:
-            print(f"{Fore.RED}Failed to save config: {exc}")
+            print(f"{Fore.RED}Failed to save config: {exc}{Style.RESET_ALL}")
 
         try:
             with open(backup_file, "w") as handle:
                 json.dump(data, handle, indent=2)
         except Exception as exc:
             print(
-                f"{Fore.YELLOW}Note: Could not write config backup ({backup_file}): {exc}"
+                f"{Fore.YELLOW}Note: Could not write config backup ({backup_file}): {exc}{Style.RESET_ALL}"
             )
 
     def _load_config(self):
@@ -3625,6 +3700,16 @@ class InteractiveQueue(cmd.Cmd):
             with open(path) as handle:
                 data = json.load(handle)
             self.config.from_dict(data)
+            # Restore session_url_directory from config (survives restarts).
+            # A later session 'load' may override this value.
+            dir_value = data.get("session_url_directory")
+            if dir_value and self.session_url_directory is None:
+                try:
+                    restored = Path(str(dir_value)).expanduser()
+                    if restored.exists():
+                        self.session_url_directory = restored
+                except Exception:
+                    pass
             return True
 
         loaded = False
@@ -3632,7 +3717,7 @@ class InteractiveQueue(cmd.Cmd):
             if config_file.exists():
                 loaded = _load_from(config_file)
         except Exception as exc:
-            print(f"{Fore.YELLOW}Note: Could not load config ({config_file}): {exc}")
+            print(f"{Fore.YELLOW}Note: Could not load config ({config_file}): {exc}{Style.RESET_ALL}")
 
         if not loaded and backup_file.exists():
             try:
@@ -3643,7 +3728,7 @@ class InteractiveQueue(cmd.Cmd):
                 )
             except Exception as exc:
                 print(
-                    f"{Fore.YELLOW}Note: Could not load config backup ({backup_file}): {exc}"
+                    f"{Fore.YELLOW}Note: Could not load config backup ({backup_file}): {exc}{Style.RESET_ALL}"
                 )
 
     def _ensure_downloader(self) -> bool:
@@ -3687,7 +3772,7 @@ class InteractiveQueue(cmd.Cmd):
                 if self.config.auto_status:
                     self._start_status_updates()
             except Exception as exc:
-                print(f"{Fore.RED}Failed to start workers: {exc}")
+                print(f"{Fore.RED}Failed to start workers: {exc}{Style.RESET_ALL}")
                 self.dlq = None
                 return False
         return True
@@ -3708,7 +3793,7 @@ class InteractiveQueue(cmd.Cmd):
                     if active:
                         queue_size = self.dlq.get_queue_size()
                         print(
-                            f"\r{Fore.BLUE}STATUS: Active: {len(active)}, Queue: {queue_size}    ",
+                            f"\r{Fore.BLUE}STATUS: Active: {len(active)}, Queue: {queue_size}{Style.RESET_ALL}    ",
                             end="",
                         )
                     time.sleep(2)
@@ -3733,7 +3818,12 @@ class InteractiveQueue(cmd.Cmd):
                     pass
                 if self.auto_start_done.is_set():
                     break
-                if self.dlq or not self.pending:
+                if self.dlq:
+                    self.auto_start_ready.clear()
+                    continue
+                with self._pending_lock:
+                    has_pending = bool(self.pending)
+                if not has_pending:
                     self.auto_start_ready.clear()
                     continue
                 try:
@@ -3750,8 +3840,11 @@ class InteractiveQueue(cmd.Cmd):
         threading.Thread(target=_auto_runner, name="auto-start", daemon=True).start()
 
     def _signal_auto_start_ready(self) -> None:
-        if not self.dlq and self.pending:
-            self.auto_start_ready.set()
+        if not self.dlq:
+            with self._pending_lock:
+                has_pending = bool(self.pending)
+            if has_pending:
+                self.auto_start_ready.set()
 
     def _apply_session_data(self, session_data: dict, *, merge: bool) -> int:
         # ------------------------------------------------------------------
@@ -3875,7 +3968,8 @@ class InteractiveQueue(cmd.Cmd):
         normalized_dropped = 0
 
         if not merge:
-            self.pending = []
+            with self._pending_lock:
+                self.pending = []
             self.all_urls = set()
             if not self.dlq:
                 self.worker_dir_overrides.clear()
@@ -3908,11 +4002,14 @@ class InteractiveQueue(cmd.Cmd):
             restored_entries.append(restored_entry)
             self._remember_directory_for_url(norm_url, directory_path)
 
+        with self._pending_lock:
+            if merge:
+                self.pending.extend(restored_entries)
+            else:
+                self.pending = list(restored_entries)
         if merge:
-            self.pending.extend(restored_entries)
             self.all_urls.update(entry.url for entry in restored_entries)
         else:
-            self.pending = list(restored_entries)
             self.all_urls = {entry.url for entry in restored_entries}
 
         # Restore broader URL tracking and per-URL directory overrides (for retryall etc.).
@@ -4031,7 +4128,7 @@ class InteractiveQueue(cmd.Cmd):
                             )
                     except Exception as exc:
                         print(
-                            f"{Fore.YELLOW}Note: Could not assign worker {worker_id} directory while loading: {exc}"
+                            f"{Fore.YELLOW}Note: Could not assign worker {worker_id} directory while loading: {exc}{Style.RESET_ALL}"
                         )
             else:
                 if not merge:
@@ -4061,7 +4158,7 @@ class InteractiveQueue(cmd.Cmd):
 
         if restored_failures and not self.config.keep_failed:
             print(
-                f"{Fore.YELLOW}Note: keep_failed is disabled, skipping restoration of {len(restored_failures)} failed downloads"
+                f"{Fore.YELLOW}Note: keep_failed is disabled, skipping restoration of {len(restored_failures)} failed downloads{Style.RESET_ALL}"
             )
             restored_failures = []
 
@@ -4103,7 +4200,8 @@ class InteractiveQueue(cmd.Cmd):
         # completed URL list. If we have all_urls, infer completed URLs as
         # all_urls - pending - failed.
         if loaded_completed_urls is None and self.all_urls:
-            pending_urls = {entry.url for entry in self.pending}
+            with self._pending_lock:
+                pending_urls = {entry.url for entry in self.pending}
             failed_urls = {entry.url for entry in restored_failures}
             inferred_completed = set(self.all_urls) - pending_urls - failed_urls
             if inferred_completed:
@@ -4153,7 +4251,7 @@ class InteractiveQueue(cmd.Cmd):
             self._add_url(normalized)
             return
 
-        print(f"{Fore.RED}Unknown command or invalid URL: {line}")
+        print(f"{Fore.RED}Unknown command or invalid URL: {line}{Style.RESET_ALL}")
         print(f"Type {Fore.YELLOW}?{Style.RESET_ALL} for help")
         return
 
@@ -4165,7 +4263,7 @@ class InteractiveQueue(cmd.Cmd):
         """
         if not url or not self._validate_url(url):
             if announce:
-                print(f"{Fore.RED}Invalid URL: {url}")
+                print(f"{Fore.RED}Invalid URL: {url}{Style.RESET_ALL}")
             return False
 
         # If clipboard is armed, learn whitelist domain from the next manual URL.
@@ -4189,36 +4287,67 @@ class InteractiveQueue(cmd.Cmd):
             if af_name:
                 base = directory_override or self.config.download_dir or Path.cwd()
                 af_dir = Path(base) / af_name
-                try:
-                    af_dir.mkdir(parents=True, exist_ok=True)
-                except Exception as exc:
-                    _af_msg(
-                        f"{Fore.YELLOW}AF: Could not create directory '{af_dir}': {exc}{Style.RESET_ALL}"
-                    )
+                # gallery-dl creates the directory automatically at download
+                # time, so we don't need to mkdir here.
                 directory_override = af_dir
+                self._af_probe_failures.pop(url, None)  # reset on success
                 _af_msg(
                     f"{Fore.CYAN}AF: Using autofolder → {af_dir}{Style.RESET_ALL}"
                 )
             else:
-                _af_msg(
-                    f"{Fore.YELLOW}AF: Could not determine remote folder name for {url} – using default directory{Style.RESET_ALL}"
-                )
+                AF_MAX_RETRIES = 3
+                fail_count = self._af_probe_failures.get(url, 0) + 1
+                self._af_probe_failures[url] = fail_count
+
+                if fail_count < AF_MAX_RETRIES:
+                    _af_msg(
+                        f"{Fore.YELLOW}AF: Probe failed ({fail_count}/{AF_MAX_RETRIES}) for {url} – re-queuing to end of list{Style.RESET_ALL}"
+                    )
+                    # Re-append the URL at the end so we can retry the probe later.
+                    requeued = False
+                    if self.dlq is None:
+                        with self._pending_lock:
+                            if not any(entry.url == url for entry in self.pending):
+                                self.pending.append(PendingEntry(url, directory_override))
+                                requeued = True
+                    else:
+                        requeued = self.dlq.add(url, directory_override)
+                    if requeued:
+                        self._save_temp_state()
+                        if self.dlq is None:
+                            self._signal_auto_start_ready()
+                    else:
+                        _af_msg(
+                            f"{Fore.YELLOW}AF: URL already queued, skipping re-queue: {url}{Style.RESET_ALL}"
+                        )
+                    return False
+                else:
+                    self._af_probe_failures.pop(url, None)  # reset counter
+                    _af_msg(
+                        f"{Fore.YELLOW}AF: Probe failed {AF_MAX_RETRIES}x for {url} – adding with default directory{Style.RESET_ALL}"
+                    )
+                    # Fall through to normal add path with session directory
         added_now = False
 
         if self.dlq is None:
-            if not any(entry.url == url for entry in self.pending):
-                self.pending.append(PendingEntry(url, directory_override))
-                self._signal_auto_start_ready()
-                dir_msg = f" (dir: {directory_override})" if directory_override else ""
-                if announce:
-                    print(
-                        f"{Fore.WHITE}PENDING: Added to pending: {url}{dir_msg}{Style.RESET_ALL}"
-                    )
-                added_now = True
-                self._remember_directory_for_url(url, directory_override)
-            else:
-                if announce:
-                    print(f"{Fore.YELLOW}WARNING: Already in pending: {url}")
+            with self._pending_lock:
+                if not any(entry.url == url for entry in self.pending):
+                    self.pending.append(PendingEntry(url, directory_override))
+                    dir_msg = f" (dir: {directory_override})" if directory_override else ""
+                    if announce:
+                        print(
+                            f"{Fore.WHITE}PENDING: Added to pending: {url}{dir_msg}{Style.RESET_ALL}"
+                        )
+                    added_now = True
+                    self._remember_directory_for_url(url, directory_override)
+                else:
+                    if announce:
+                        print(f"{Fore.YELLOW}WARNING: Already in pending: {url}{Style.RESET_ALL}")
+            # Signal auto-start OUTSIDE the lock to avoid deadlock —
+            # _signal_auto_start_ready() also acquires _pending_lock,
+            # and threading.Lock is not reentrant.
+            if added_now:
+                self.auto_start_ready.set()
         else:
             if self.dlq.add(url, directory_override):
                 dir_msg = f" (dir: {directory_override})" if directory_override else ""
@@ -4231,7 +4360,7 @@ class InteractiveQueue(cmd.Cmd):
             else:
                 if announce:
                     print(
-                        f"{Fore.YELLOW}WARNING: Duplicate URL (already queued/completed): {url}"
+                        f"{Fore.YELLOW}WARNING: Duplicate URL (already queued/completed): {url}{Style.RESET_ALL}"
                     )
 
         if added_now and self.dlq is None:
@@ -4401,34 +4530,35 @@ class InteractiveQueue(cmd.Cmd):
 
         if self.dlq.is_paused():
             self.dlq.resume()
-            print(f"{Fore.GREEN}RESUMED: Resumed workers")
+            print(f"{Fore.GREEN}RESUMED: Resumed workers{Style.RESET_ALL}")
 
         # Ensure workers are alive (respawn any that have died).
         spawned = self.dlq.ensure_workers_alive()
         if spawned:
-            print(f"{Fore.GREEN}WORKERS: Spawned {spawned} replacement worker(s)")
+            print(f"{Fore.GREEN}WORKERS: Spawned {spawned} replacement worker(s){Style.RESET_ALL}")
 
         # Apply any stored per-worker directory overrides (including ones planned for future workers).
         self._apply_pending_worker_dir_overrides()
 
         added = 0
         remaining = []
-        for entry in self.pending:
-            if self.dlq.add(entry.url, entry.directory):
-                added += 1
-            else:
-                remaining.append(entry)
-        self.pending = remaining
+        with self._pending_lock:
+            for entry in self.pending:
+                if self.dlq.add(entry.url, entry.directory):
+                    added += 1
+                else:
+                    remaining.append(entry)
+            self.pending = remaining
 
         if added:
-            print(f"{Fore.GREEN}STARTED: Added {added} URLs from pending list")
+            print(f"{Fore.GREEN}STARTED: Added {added} URLs from pending list{Style.RESET_ALL}")
 
         if (
             added == 0
             and not self.dlq.get_queue_size()
             and not self.dlq.get_active_downloads()
         ):
-            print(f"{Fore.YELLOW}No URLs to download. Add some URLs first!")
+            print(f"{Fore.YELLOW}No URLs to download. Add some URLs first!{Style.RESET_ALL}")
 
         return False
 
@@ -4436,9 +4566,9 @@ class InteractiveQueue(cmd.Cmd):
         """Pause all workers."""
         if self.dlq:
             self.dlq.pause()
-            print(f"{Fore.YELLOW}PAUSED: Paused all workers")
+            print(f"{Fore.YELLOW}PAUSED: Paused all workers{Style.RESET_ALL}")
         else:
-            print(f"{Fore.RED}No workers running")
+            print(f"{Fore.RED}No workers running{Style.RESET_ALL}")
         return False
 
     def do_resume(self, arg: str) -> bool:
@@ -4448,31 +4578,31 @@ class InteractiveQueue(cmd.Cmd):
             # Ensure workers are alive (respawn any that have died).
             spawned = self.dlq.ensure_workers_alive()
             if spawned:
-                print(f"{Fore.GREEN}WORKERS: Spawned {spawned} replacement worker(s)")
-            print(f"{Fore.GREEN}RESUMED: Resumed all workers")
+                print(f"{Fore.GREEN}WORKERS: Spawned {spawned} replacement worker(s){Style.RESET_ALL}")
+            print(f"{Fore.GREEN}RESUMED: Resumed all workers{Style.RESET_ALL}")
             return False
 
         filename = arg.strip() or self.config.session_file
         session_path = Path(filename)
 
         if not session_path.exists():
-            print(f"{Fore.RED}Session file not found: {session_path}")
+            print(f"{Fore.RED}Session file not found: {session_path}{Style.RESET_ALL}")
             return False
 
         try:
             with open(session_path) as f:
                 session_data = json.load(f)
         except Exception as exc:
-            print(f"{Fore.RED}Failed to resume session: {exc}")
+            print(f"{Fore.RED}Failed to resume session: {exc}{Style.RESET_ALL}")
             return False
 
         try:
             restored_count = self._apply_session_data(session_data, merge=False)
         except UnsupportedSessionFormatError as exc:
-            print(f"{Fore.RED}{exc}")
+            print(f"{Fore.RED}{exc}{Style.RESET_ALL}")
             return False
         print(
-            f"{Fore.GREEN}RESUME: Loaded session from {session_path} with {restored_count} URLs"
+            f"{Fore.GREEN}RESUME: Loaded session from {session_path} with {restored_count} URLs{Style.RESET_ALL}"
         )
 
         worker_dirs = session_data.get("worker_directories")
@@ -4494,43 +4624,45 @@ class InteractiveQueue(cmd.Cmd):
         if self.dlq:
             added = self.dlq.retry_failed()
             if added:
-                print(f"{Fore.GREEN}RETRY: Re-queued {added} failed downloads")
+                print(f"{Fore.GREEN}RETRY: Re-queued {added} failed downloads{Style.RESET_ALL}")
                 if self.dlq.is_paused():
                     print(
-                        f"{Fore.YELLOW}Workers are paused, use 'resume' to continue processing"
+                        f"{Fore.YELLOW}Workers are paused, use 'resume' to continue processing{Style.RESET_ALL}"
                     )
             else:
-                print(f"{Fore.CYAN}No failed downloads awaiting retry")
+                print(f"{Fore.CYAN}No failed downloads awaiting retry{Style.RESET_ALL}")
             return False
 
         if not self.failed_offline:
-            print(f"{Fore.CYAN}No failed downloads recorded")
+            print(f"{Fore.CYAN}No failed downloads recorded{Style.RESET_ALL}")
             return False
 
-        existing_pending = {entry.url for entry in self.pending}
         added = 0
         skipped = 0
-        for entry in list(self.failed_offline.values()):
-            if entry.url in existing_pending:
-                skipped += 1
-                continue
-            self.pending.append(PendingEntry(entry.url, entry.directory))
-            self.all_urls.add(entry.url)
-            self._remember_directory_for_url(entry.url, entry.directory)
-            added += 1
+        with self._pending_lock:
+            existing_pending = {entry.url for entry in self.pending}
+            for entry in list(self.failed_offline.values()):
+                if entry.url in existing_pending:
+                    skipped += 1
+                    continue
+                self.pending.append(PendingEntry(entry.url, entry.directory))
+                self.all_urls.add(entry.url)
+                self._remember_directory_for_url(entry.url, entry.directory)
+                added += 1
 
         self.failed_offline.clear()
 
         if added:
-            print(f"{Fore.GREEN}RETRY: Added {added} failed downloads back to pending")
+            print(f"{Fore.GREEN}RETRY: Added {added} failed downloads back to pending{Style.RESET_ALL}")
             if skipped:
-                print(f"{Fore.YELLOW}Skipped {skipped} already-pending URLs")
+                print(f"{Fore.YELLOW}Skipped {skipped} already-pending URLs{Style.RESET_ALL}")
             print(
                 f"{Fore.CYAN}Use 'start' to process the retried downloads or wait for auto-start{Style.RESET_ALL}"
             )
             self._signal_auto_start_ready()
+            self._save_temp_state()
         else:
-            print(f"{Fore.CYAN}No failed downloads were ready for retry")
+            print(f"{Fore.CYAN}No failed downloads were ready for retry{Style.RESET_ALL}")
 
         return False
 
@@ -4541,10 +4673,11 @@ class InteractiveQueue(cmd.Cmd):
         # (add_force discards from completed_urls).
         completed_set = self.dlq.snapshot_completed_urls() if self.dlq else set(self.completed_offline)
         if not completed_set:
-            print(f"{Fore.CYAN}No completed downloads to retry")
+            print(f"{Fore.CYAN}No completed downloads to retry{Style.RESET_ALL}")
             return False
 
-        pending_set = {entry.url for entry in self.pending}
+        with self._pending_lock:
+            pending_set = {entry.url for entry in self.pending}
         queued_set = self.dlq.snapshot_queued_urls() if self.dlq else set()
         active_urls: Set[str] = set()
         if self.dlq:
@@ -4571,6 +4704,7 @@ class InteractiveQueue(cmd.Cmd):
 
         added = 0
         skipped = 0
+        offline_entries_to_add: List[PendingEntry] = []
         for url in ordered:
             if url in pending_set or url in queued_set or url in active_urls:
                 skipped += 1
@@ -4592,22 +4726,27 @@ class InteractiveQueue(cmd.Cmd):
                 else:
                     skipped += 1
             else:
-                self.pending.append(PendingEntry(url, directory_path))
+                offline_entries_to_add.append(PendingEntry(url, directory_path))
                 self._remember_directory_for_url(url, directory_path)
                 self.completed_offline.discard(url)
                 added += 1
 
+        if offline_entries_to_add:
+            with self._pending_lock:
+                self.pending.extend(offline_entries_to_add)
+
         if added:
-            print(f"{Fore.GREEN}RETRYALL: Re-queued {added} completed downloads")
+            print(f"{Fore.GREEN}RETRYALL: Re-queued {added} completed downloads{Style.RESET_ALL}")
             if skipped:
-                print(f"{Fore.YELLOW}Skipped {skipped} already pending/active/queued URLs")
+                print(f"{Fore.YELLOW}Skipped {skipped} already pending/active/queued URLs{Style.RESET_ALL}")
             if self.dlq and self.dlq.is_paused():
-                print(f"{Fore.YELLOW}Workers are paused, use 'resume' to continue processing")
+                print(f"{Fore.YELLOW}Workers are paused, use 'resume' to continue processing{Style.RESET_ALL}")
             if not self.dlq:
                 print(f"{Fore.CYAN}Use 'start' to process the retried downloads or wait for auto-start{Style.RESET_ALL}")
                 self._signal_auto_start_ready()
+            self._save_temp_state()
         else:
-            print(f"{Fore.CYAN}No completed downloads were ready for retry")
+            print(f"{Fore.CYAN}No completed downloads were ready for retry{Style.RESET_ALL}")
 
         return False
 
@@ -4628,7 +4767,9 @@ class InteractiveQueue(cmd.Cmd):
             else:
                 print(f"Worker threads: {alive_count}/{desired} alive")
 
-        print(f"Pending URLs: {len(self.pending)}")
+        with self._pending_lock:
+            pending_count = len(self.pending)
+        print(f"Pending URLs: {pending_count}")
         print(f"Total URLs tracked: {len(self.all_urls)}")
         failed_count = self.dlq.failed_count() if self.dlq else len(self.failed_offline)
         print(f"Failed downloads awaiting retry: {failed_count}")
@@ -4660,7 +4801,8 @@ class InteractiveQueue(cmd.Cmd):
             print(f"Status: {'PAUSED' if self.dlq.is_paused() else 'RUNNING'}")
 
             # Calculate URLs that would be saved
-            pending_url_set = {entry.url for entry in self.pending}
+            with self._pending_lock:
+                pending_url_set = {entry.url for entry in self.pending}
             urls_to_save_count = len(pending_url_set)
             for url in self.all_urls:
                 if url not in completed_snapshot and url not in pending_url_set:
@@ -4700,7 +4842,8 @@ class InteractiveQueue(cmd.Cmd):
         else:
             print("Workers: Not started")
             print(f"Completed downloads: {len(self.completed_offline)}")
-            print(f"URLs that would be saved: {len(self.pending)}")
+            with self._pending_lock:
+                print(f"URLs that would be saved: {len(self.pending)}")
             if self._has_worker_dir_overrides():
                 self._print_worker_dirs(label="Planned Worker Directories")
 
@@ -4724,7 +4867,7 @@ class InteractiveQueue(cmd.Cmd):
     def do_worker(self, arg: str) -> bool:
         """Follow live stdout/stderr for a worker. Usage: worker <id> [tail_lines]"""
         if not self.dlq:
-            print(f"{Fore.RED}No workers running")
+            print(f"{Fore.RED}No workers running{Style.RESET_ALL}")
             return False
 
         args = arg.split()
@@ -4743,11 +4886,11 @@ class InteractiveQueue(cmd.Cmd):
         try:
             worker_id = int(args[0])
         except ValueError:
-            print(f"{Fore.RED}Worker id must be an integer")
+            print(f"{Fore.RED}Worker id must be an integer{Style.RESET_ALL}")
             return False
 
         if worker_id < 0 or worker_id >= self.dlq.next_worker_id:
-            print(f"{Fore.RED}No worker with id {worker_id}")
+            print(f"{Fore.RED}No worker with id {worker_id}{Style.RESET_ALL}")
             return False
 
         try:
@@ -4775,7 +4918,7 @@ class InteractiveQueue(cmd.Cmd):
                     prefix = line
                 print(f"{color}Worker {worker_id}{Style.RESET_ALL} {prefix}")
         else:
-            print(f"{Fore.YELLOW}No log output from worker {worker_id} yet")
+            print(f"{Fore.YELLOW}No log output from worker {worker_id} yet{Style.RESET_ALL}")
 
         event = self.dlq.get_worker_event(worker_id)
         event.clear()
@@ -4822,7 +4965,7 @@ class InteractiveQueue(cmd.Cmd):
                 if truncated:
                     _clear_status_line()
                     print(
-                        f"{Fore.YELLOW}... worker {worker_id} log truncated, showing latest entries"
+                        f"{Fore.YELLOW}... worker {worker_id} log truncated, showing latest entries{Style.RESET_ALL}"
                     )
                 if new_lines:
                     _clear_status_line()
@@ -4876,12 +5019,12 @@ class InteractiveQueue(cmd.Cmd):
 
     def _follow_all_workers(self, tail_lines: int) -> bool:
         if not self.dlq:
-            print(f"{Fore.RED}No workers running")
+            print(f"{Fore.RED}No workers running{Style.RESET_ALL}")
             return False
 
         worker_ids = [wid for wid in range(self.dlq.next_worker_id)]
         if not worker_ids:
-            print(f"{Fore.YELLOW}No workers available yet")
+            print(f"{Fore.YELLOW}No workers available yet{Style.RESET_ALL}")
             return False
 
         tail_lines = max(0, tail_lines)
@@ -4918,7 +5061,7 @@ class InteractiveQueue(cmd.Cmd):
                     )
                     if truncated:
                         print(
-                            f"{Fore.YELLOW}... worker {wid} log truncated, showing latest entries"
+                            f"{Fore.YELLOW}... worker {wid} log truncated, showing latest entries{Style.RESET_ALL}"
                         )
                     if new_lines:
                         any_activity = True
@@ -5001,27 +5144,35 @@ class InteractiveQueue(cmd.Cmd):
             directive = first_token.lower()
             if directive in {"default", "none", "clear", "reset"}:
                 self.session_url_directory = None
+                self._save_config()
                 print(
-                    f"{Fore.GREEN}Session default directory cleared – using global/default location"
+                    f"{Fore.GREEN}Session default directory cleared – using global/default location{Style.RESET_ALL}"
                 )
                 return False
 
             path_input = _normalize_path_input(" ".join(tokens))
             try:
                 path_obj = Path(path_input).expanduser()
+                # Resolve relative paths against the current session directory
+                # so that 'wd ..', 'wd .\album', 'wd ..\other' work intuitively.
+                if not path_obj.is_absolute() and self.session_url_directory is not None:
+                    path_obj = (self.session_url_directory / path_obj).resolve()
+                else:
+                    path_obj = path_obj.resolve()
                 path_obj.mkdir(parents=True, exist_ok=True)
                 self.session_url_directory = path_obj
+                self._save_config()
                 free_info = self._format_free_space_label(path_obj)
                 info_text = f" ({free_info})" if free_info else ""
                 print(
-                    f"{Fore.GREEN}Session default directory set to {path_obj}{info_text}"
+                    f"{Fore.GREEN}Session default directory set to {path_obj}{info_text}{Style.RESET_ALL}"
                 )
             except Exception as exc:
-                print(f"{Fore.RED}Failed to set session default directory: {exc}")
+                print(f"{Fore.RED}Failed to set session default directory: {exc}{Style.RESET_ALL}")
             return False
 
         if worker_id < 0:
-            print(f"{Fore.RED}Worker id must be non-negative")
+            print(f"{Fore.RED}Worker id must be non-negative{Style.RESET_ALL}")
             return False
 
         if len(tokens) == 1:
@@ -5075,9 +5226,9 @@ class InteractiveQueue(cmd.Cmd):
                     if free_info:
                         msg = f"{msg} ({free_info})"
 
-            print(f"{Fore.GREEN}Worker {worker_id} directory set to: {msg}")
+            print(f"{Fore.GREEN}Worker {worker_id} directory set to: {msg}{Style.RESET_ALL}")
         except Exception as e:
-            print(f"{Fore.RED}Failed to set directory: {e}")
+            print(f"{Fore.RED}Failed to set directory: {e}{Style.RESET_ALL}")
 
         return False
 
@@ -5098,7 +5249,7 @@ class InteractiveQueue(cmd.Cmd):
         for entry in history[-limit:]:
             status = f"{Fore.GREEN}SUCCESS" if entry["success"] else f"{Fore.RED}FAILED"
             timestamp = datetime.fromisoformat(entry["timestamp"]).strftime("%H:%M:%S")
-            print(f"{status} [{timestamp}] {entry['url']} ({entry['duration']:.1f}s)")
+            print(f"{status} [{timestamp}] {entry['url']} ({entry['duration']:.1f}s){Style.RESET_ALL}")
 
         return False
 
@@ -5117,7 +5268,7 @@ class InteractiveQueue(cmd.Cmd):
             if hasattr(self.config, key):
                 print(f"{key}: {getattr(self.config, key)}")
             else:
-                print(f"{Fore.RED}Unknown config key: {key}")
+                print(f"{Fore.RED}Unknown config key: {key}{Style.RESET_ALL}")
         else:
             # Set config
             key, value = args[0], " ".join(args[1:])
@@ -5147,7 +5298,7 @@ class InteractiveQueue(cmd.Cmd):
                             value = normalized
 
                     setattr(self.config, key, value)
-                    print(f"{Fore.GREEN}Set {key} = {value}")
+                    print(f"{Fore.GREEN}Set {key} = {value}{Style.RESET_ALL}")
                     self._save_config()
 
                     # Special handling for workers
@@ -5159,11 +5310,11 @@ class InteractiveQueue(cmd.Cmd):
                             old_count, new_count = self.dlq.resize_workers(new_workers)
                             if new_count < old_count:
                                 print(
-                                    f"{Fore.YELLOW}WORKERS: Downsizing {old_count} -> {new_count}. Extra workers will finish their current download and then stop picking up new jobs."
+                                    f"{Fore.YELLOW}WORKERS: Downsizing {old_count} -> {new_count}. Extra workers will finish their current download and then stop picking up new jobs.{Style.RESET_ALL}"
                                 )
                             elif new_count > old_count:
                                 print(
-                                    f"{Fore.YELLOW}WORKERS: Upsizing {old_count} -> {new_count}. New workers started immediately."
+                                    f"{Fore.YELLOW}WORKERS: Upsizing {old_count} -> {new_count}. New workers started immediately.{Style.RESET_ALL}"
                                 )
                                 self._apply_pending_worker_dir_overrides()
                         except Exception as exc:
@@ -5179,7 +5330,7 @@ class InteractiveQueue(cmd.Cmd):
                         and self.config.directory_template
                     ):
                         print(
-                            f"{Fore.YELLOW}Note: flat_directories overrides directory_template for downloads"
+                            f"{Fore.YELLOW}Note: flat_directories overrides directory_template for downloads{Style.RESET_ALL}"
                         )
                     elif key == "keep_failed" and not self.config.keep_failed:
                         if self.dlq:
@@ -5187,9 +5338,9 @@ class InteractiveQueue(cmd.Cmd):
                         self.failed_offline.clear()
 
                 except ValueError as e:
-                    print(f"{Fore.RED}Invalid value for {key}: {e}")
+                    print(f"{Fore.RED}Invalid value for {key}: {e}{Style.RESET_ALL}")
             else:
-                print(f"{Fore.RED}Unknown config key: {key}")
+                print(f"{Fore.RED}Unknown config key: {key}{Style.RESET_ALL}")
 
         return False
 
@@ -5219,7 +5370,10 @@ class InteractiveQueue(cmd.Cmd):
         urls_to_save: List[str] = []
         pending_entries: List[Tuple[str, Optional[str]]] = []
 
-        for entry in self.pending:
+        with self._pending_lock:
+            pending_snapshot = list(self.pending)
+
+        for entry in pending_snapshot:
             urls_to_save.append(entry.url)
             pending_entries.append(
                 (entry.url, str(entry.directory) if entry.directory else None)
@@ -5227,7 +5381,7 @@ class InteractiveQueue(cmd.Cmd):
 
         if self.dlq:
             completed_snapshot = self.dlq.snapshot_completed_urls()
-            pending_urls_set = {entry.url for entry in self.pending}
+            pending_urls_set = {entry.url for entry in pending_snapshot}
             for url in sorted(self.all_urls):
                 if url not in completed_snapshot and url not in pending_urls_set:
                     urls_to_save.append(url)
@@ -5331,15 +5485,15 @@ class InteractiveQueue(cmd.Cmd):
         try:
             wrote = _write_json_atomic_if_changed(filename, session_data)
             if wrote:
-                print(f"{Fore.GREEN}SAVED: Session saved to {filename}")
+                print(f"{Fore.GREEN}SAVED: Session saved to {filename}{Style.RESET_ALL}")
             else:
-                print(f"{Fore.GREEN}SAVED: Session unchanged (skipped write): {filename}")
+                print(f"{Fore.GREEN}SAVED: Session unchanged (skipped write): {filename}{Style.RESET_ALL}")
             print(f"Saved {len(urls_to_save)} uncompleted URLs")
             if failed_entries:
                 print(f"Saved {len(failed_entries)} failed downloads for future retry")
             self._delete_temp_state()
         except Exception as e:
-            print(f"{Fore.RED}Failed to save session: {e}")
+            print(f"{Fore.RED}Failed to save session: {e}{Style.RESET_ALL}")
 
         return False
 
@@ -5357,19 +5511,19 @@ class InteractiveQueue(cmd.Cmd):
                 session_data = json.load(f)
 
         except FileNotFoundError:
-            print(f"{Fore.RED}Session file not found: {filename}")
+            print(f"{Fore.RED}Session file not found: {filename}{Style.RESET_ALL}")
             return False
         except Exception as e:
-            print(f"{Fore.RED}Failed to load session: {e}")
+            print(f"{Fore.RED}Failed to load session: {e}{Style.RESET_ALL}")
             return False
 
         try:
             restored_count = self._apply_session_data(session_data, merge=True)
         except UnsupportedSessionFormatError as exc:
-            print(f"{Fore.RED}{exc}")
+            print(f"{Fore.RED}{exc}{Style.RESET_ALL}")
             return False
 
-        print(f"{Fore.GREEN}LOADED: Session loaded from {filename}")
+        print(f"{Fore.GREEN}LOADED: Session loaded from {filename}{Style.RESET_ALL}")
         print(f"Added {restored_count} URLs to pending")
 
         if "total_urls_added" in session_data:
@@ -5382,13 +5536,15 @@ class InteractiveQueue(cmd.Cmd):
 
     def do_pending(self, arg: str) -> bool:
         """Show pending URLs (before workers start)."""
-        if not self.pending:
+        with self._pending_lock:
+            pending_snapshot = list(self.pending)
+        if not pending_snapshot:
             print("No pending URLs")
         else:
             print(
-                f"\n{Fore.CYAN}=== Pending URLs ({len(self.pending)}) ==={Style.RESET_ALL}"
+                f"\n{Fore.CYAN}=== Pending URLs ({len(pending_snapshot)}) ==={Style.RESET_ALL}"
             )
-            for i, entry in enumerate(self.pending):
+            for i, entry in enumerate(pending_snapshot):
                 dir_msg = f" [dir: {entry.directory}]" if entry.directory else ""
                 print(f"{i:2d}: {entry.url}{dir_msg}")
         return False
@@ -5403,7 +5559,8 @@ class InteractiveQueue(cmd.Cmd):
             f"\n{Fore.CYAN}=== All Tracked URLs ({len(self.all_urls)}) ==={Style.RESET_ALL}"
         )
 
-        pending_set = {entry.url for entry in self.pending}
+        with self._pending_lock:
+            pending_set = {entry.url for entry in self.pending}
         completed_set = self.dlq.snapshot_completed_urls() if self.dlq else set(self.completed_offline)
         queued_set = self.dlq.snapshot_queued_urls() if self.dlq else set()
 
@@ -5420,7 +5577,8 @@ class InteractiveQueue(cmd.Cmd):
             print(f"{i:2d}: {status}{Style.RESET_ALL} {url}")
 
         # Show what would be saved
-        urls_to_save = [entry.url for entry in self.pending]
+        with self._pending_lock:
+            urls_to_save = [entry.url for entry in self.pending]
         if self.dlq:
             for url in self.all_urls:
                 if url not in completed_set and url not in pending_set:
@@ -5434,7 +5592,7 @@ class InteractiveQueue(cmd.Cmd):
     def do_remove(self, arg: str) -> bool:
         """Remove URL from pending list. Usage: remove <index|url>"""
         if self.dlq:
-            print(f"{Fore.RED}Cannot remove - workers already running")
+            print(f"{Fore.RED}Cannot remove - workers already running{Style.RESET_ALL}")
             return False
 
         arg = arg.strip()
@@ -5443,44 +5601,47 @@ class InteractiveQueue(cmd.Cmd):
             return False
 
         removed: Optional[PendingEntry] = None
-        if arg.isdigit():
-            idx = int(arg)
-            if 0 <= idx < len(self.pending):
-                removed = self.pending.pop(idx)
-        else:
-            for entry in self.pending:
-                if entry.url == arg:
-                    self.pending.remove(entry)
-                    removed = entry
-                    break
+        with self._pending_lock:
+            if arg.isdigit():
+                idx = int(arg)
+                if 0 <= idx < len(self.pending):
+                    removed = self.pending.pop(idx)
+            else:
+                for entry in self.pending:
+                    if entry.url == arg:
+                        self.pending.remove(entry)
+                        removed = entry
+                        break
 
         if removed:
             # Also remove from all_urls tracking if it was only pending
             self.all_urls.discard(removed.url)
             self._forget_directory_for_url(removed.url)
             dir_msg = f" (dir: {removed.directory})" if removed.directory else ""
-            print(f"{Fore.GREEN}REMOVED: Removed: {removed.url}{dir_msg}")
+            print(f"{Fore.GREEN}REMOVED: Removed: {removed.url}{dir_msg}{Style.RESET_ALL}")
             self._save_temp_state()
         else:
-            print(f"{Fore.RED}Nothing removed")
+            print(f"{Fore.RED}Nothing removed{Style.RESET_ALL}")
 
         return False
 
     def do_clearqueue(self, arg: str) -> bool:
         """Clear pending list."""
         if self.dlq:
-            print(f"{Fore.RED}Cannot clear - workers already running")
+            print(f"{Fore.RED}Cannot clear - workers already running{Style.RESET_ALL}")
             return False
 
-        count = len(self.pending)
+        with self._pending_lock:
+            cleared_entries = list(self.pending)
+            self.pending.clear()
+        count = len(cleared_entries)
 
         # Remove pending URLs from all_urls tracking
-        for entry in self.pending:
+        for entry in cleared_entries:
             self.all_urls.discard(entry.url)
             self._forget_directory_for_url(entry.url)
 
-        self.pending.clear()
-        print(f"{Fore.GREEN}CLEARED: Cleared {count} pending URLs")
+        print(f"{Fore.GREEN}CLEARED: Cleared {count} pending URLs{Style.RESET_ALL}")
         self._save_temp_state()
         return False
 
@@ -5509,7 +5670,7 @@ class InteractiveQueue(cmd.Cmd):
             self.dlq.shutdown()
 
         self._stop_async_printer()
-        print(f"{Fore.GREEN}COMPLETE: All downloads complete – goodbye!")
+        print(f"{Fore.GREEN}COMPLETE: All downloads complete – goodbye!{Style.RESET_ALL}")
         return True
 
     def _auto_save_on_exit(self) -> None:
@@ -5520,14 +5681,14 @@ class InteractiveQueue(cmd.Cmd):
 
             wrote = _write_json_atomic_if_changed(filename, session_data)
             if wrote:
-                print(f"{Fore.GREEN}SAVED: Session saved to {filename}")
+                print(f"{Fore.GREEN}SAVED: Session saved to {filename}{Style.RESET_ALL}")
                 print(f"Saved {len(urls_to_save)} uncompleted URLs")
                 if failed_entries:
                     print(f"Saved {len(failed_entries)} failed downloads for future retry")
             self._delete_temp_state()
             # If not written (unchanged), stay silent on exit.
         except Exception as e:
-            print(f"{Fore.RED}Failed to auto-save session on exit: {e}")
+            print(f"{Fore.RED}Failed to auto-save session on exit: {e}{Style.RESET_ALL}")
 
     def do_EOF(self, arg: str) -> bool:
         """Handle Ctrl+D."""
@@ -5637,6 +5798,12 @@ Inside the shell:
 
         try:
             app._stop_clipboard_monitor()
+        except Exception:
+            pass
+
+        # Save temp state so pending/active URLs survive the interrupt.
+        try:
+            app._save_temp_state()
         except Exception:
             pass
 
