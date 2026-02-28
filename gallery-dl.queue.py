@@ -132,15 +132,24 @@ RATE_LIMIT_BACKOFF_MAX_SECONDS = 5 * 60
 
 
 def _format_bytes(num_bytes: float) -> str:
-    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    """Human-readable bytes using 1024-based units.
+
+    Uses common unit labels (KB/MB/GB/TB) and German-style decimal comma.
+    """
+
+    units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"]
     value = float(num_bytes)
+    if value < 0:
+        value = 0.0
+
     unit_index = 0
     while value >= 1024.0 and unit_index < len(units) - 1:
         value /= 1024.0
         unit_index += 1
+
     if unit_index == 0:
         return f"{int(value)} {units[unit_index]}"
-    return f"{value:.1f} {units[unit_index]}"
+    return f"{value:.1f}".replace(".", ",") + f" {units[unit_index]}"
 
 
 def _sanitize_filename(value: str, max_length: int = 120) -> str:
@@ -153,6 +162,43 @@ def _sanitize_filename(value: str, max_length: int = 120) -> str:
         prefix_len = max(1, max_length - len(suffix) - 1)
         slug = f"{slug[:prefix_len]}_{suffix}"
     return slug
+
+
+# Characters forbidden in Windows file/folder names.
+_WINDOWS_FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9).
+_WINDOWS_RESERVED_RE = re.compile(
+    r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$", re.IGNORECASE
+)
+
+
+def _sanitize_foldername(value: str, *, max_length: int = 200) -> str:
+    """Sanitize a string for use as a directory name on Windows and Linux.
+
+    - Replaces characters illegal on Windows with ``_``.
+    - Collapses consecutive underscores / whitespace.
+    - Strips leading/trailing dots, spaces, and underscores.
+    - Avoids Windows reserved device names.
+    - Truncates to *max_length* characters (appending a short hash on clash).
+    - Falls back to ``"download"`` when the result would be empty.
+    """
+    text = value.strip()
+    # Replace forbidden chars with underscore.
+    text = _WINDOWS_FORBIDDEN_RE.sub("_", text)
+    # Collapse runs of whitespace / underscores.
+    text = re.sub(r"[\s_]+", " ", text).strip()
+    # Strip leading/trailing dots, spaces, underscores (Windows dislikes these).
+    text = text.strip(". _")
+    # Guard against reserved names.
+    if _WINDOWS_RESERVED_RE.match(text):
+        text = f"_{text}"
+    if not text:
+        text = "download"
+    if len(text) > max_length:
+        suffix = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
+        prefix_len = max(1, max_length - len(suffix) - 1)
+        text = f"{text[:prefix_len]}_{suffix}"
+    return text
 
 
 def _strip_ansi(text: str) -> str:
@@ -179,7 +225,8 @@ def _set_console_title(title: str) -> None:
 
     if sys.platform.startswith("win"):
         try:
-            os.system(f"title {safe}")
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleTitleW(safe)
         except Exception:
             pass
         return
@@ -310,6 +357,26 @@ def update_gallery_dl(
                 f"{binary_name}: remote {remote_version} <> {local_version} --> local is outdated."
             )
 
+    # Download to a temporary file first so a failed download does not
+    # leave a corrupt/incomplete binary behind.
+    tmp_path = binary_path.with_suffix(binary_path.suffix + ".tmp")
+
+    download_url = f"{DOWNLOAD_BASE_URL}{remote_version}/{binary_name}"
+    if verbose:
+        print(f"Downloading new version from {download_url} ...")
+
+    try:
+        _download_file(download_url, tmp_path)
+    except Exception:
+        # Clean up partial download.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+    # Swap files: keep old binary as .old (or remove it) only after the
+    # download succeeded.
     if remove_old:
         if old_binary_path.exists():
             old_binary_path.unlink()
@@ -319,10 +386,18 @@ def update_gallery_dl(
                 old_binary_path.unlink()
             binary_path.rename(old_binary_path)
 
-    download_url = f"{DOWNLOAD_BASE_URL}{remote_version}/{binary_name}"
-    if verbose:
-        print(f"Downloading new version from {download_url} ...")
-    _download_file(download_url, binary_path)
+    # On Windows the running binary may be locked; os.replace handles
+    # atomic renames on the same filesystem.
+    if binary_path.exists():
+        try:
+            binary_path.unlink()
+        except PermissionError:
+            # Binary is locked (running); rename it out of the way.
+            try:
+                binary_path.rename(old_binary_path)
+            except Exception:
+                pass
+    os.replace(tmp_path, binary_path)
 
     try:
         binary_path.chmod(binary_path.stat().st_mode | 0o111)
@@ -424,6 +499,26 @@ class Config:
     def from_dict(self, data: dict):
         for key, value in data.items():
             if hasattr(self, key):
+                current = getattr(self, key)
+                try:
+                    if current is None:
+                        # Accept any type for None-default fields, but
+                        # convert to str when the value looks path-like.
+                        if value is not None:
+                            value = str(value)
+                    elif isinstance(current, bool):
+                        if isinstance(value, str):
+                            value = value.lower() in {"true", "1", "yes", "on"}
+                        else:
+                            value = bool(value)
+                    elif isinstance(current, int):
+                        value = int(value)
+                    elif isinstance(current, str):
+                        value = str(value)
+                    elif isinstance(current, list) and isinstance(value, str):
+                        value = value.split(",") if value else []
+                except (TypeError, ValueError):
+                    continue  # Skip values that cannot be coerced.
                 setattr(self, key, value)
 
 
@@ -680,7 +775,8 @@ class GDLQueue:
         self.next_worker_id = 0
         self._create_workers(count=int(self.config.workers))
 
-        # URL tracking
+        # URL tracking (guarded by _url_lock for iteration-safe access)
+        self._url_lock = threading.Lock()
         self.queued_urls: Set[str] = set()
         self.completed_urls: Set[str] = set()
 
@@ -702,6 +798,12 @@ class GDLQueue:
         # Approximate per-worker transfer stats (based on download directory growth)
         self.worker_transfer_lock = threading.Lock()
         self.worker_transfer: Dict[int, WorkerTransferState] = {}
+
+        # Persistent total transfer counter (since script start).
+        # This only tracks bytes *finalized* when a worker finishes a job.
+        self.total_transfer_lock = threading.Lock()
+        self.total_downloaded_bytes = 0
+        self.worker_total_downloaded_bytes: Dict[int, int] = {}
         self.unsupported_lock = threading.Lock()
         self.unsupported_details: Dict[str, str] = {}
 
@@ -720,6 +822,7 @@ class GDLQueue:
         self.worker_restart_lock = threading.Lock()
         self.worker_restart_pending: Set[int] = set()
         self.idle_callback: Optional[Callable[[], None]] = None
+        self.on_url_completed: Optional[Callable[[str], None]] = None
         self.multi_active_since_idle = False
         if failed_seed:
             self.import_failed_entries(failed_seed, replace=True)
@@ -883,6 +986,8 @@ class GDLQueue:
 
     def _create_workers(self, *, count: int):
         """Create additional worker threads."""
+        # Prune dead threads to prevent unbounded list growth.
+        self.threads = [t for t in self.threads if t.is_alive()]
         count = max(0, int(count))
         for _ in range(count):
             worker_id = self.next_worker_id
@@ -918,14 +1023,60 @@ class GDLQueue:
             old_count = int(self._desired_workers)
             self._desired_workers = new_count
 
-        # Upsize: create new threads immediately.
-        if new_count > self.next_worker_id:
-            self._create_workers(count=new_count - self.next_worker_id)
+        # Upsize: ensure enough alive workers exist.
+        alive = self.get_alive_worker_count()
+        if new_count > alive:
+            self._create_workers(count=new_count - alive)
 
         return old_count, new_count
 
+    def get_alive_worker_count(self) -> int:
+        """Return number of currently alive worker threads."""
+        return sum(1 for t in self.threads if t.is_alive())
+
+    # Thread-safe URL set accessors ----------------------------------------
+    def snapshot_completed_urls(self) -> Set[str]:
+        """Return a snapshot copy of completed_urls (iteration-safe)."""
+        with self._url_lock:
+            return set(self.completed_urls)
+
+    def snapshot_queued_urls(self) -> Set[str]:
+        """Return a snapshot copy of queued_urls (iteration-safe)."""
+        with self._url_lock:
+            return set(self.queued_urls)
+
+    def completed_count(self) -> int:
+        with self._url_lock:
+            return len(self.completed_urls)
+
+    def update_completed_urls(self, urls: Iterable[str]) -> None:
+        with self._url_lock:
+            self.completed_urls.update(urls)
+
+    def clear_completed_urls(self) -> None:
+        with self._url_lock:
+            self.completed_urls.clear()
+
+    def ensure_workers_alive(self) -> int:
+        """Ensure at least _desired_workers threads are alive.
+
+        Spawns replacement workers if some have died. Returns number of
+        workers spawned.
+        """
+        desired = self._get_desired_workers()
+        alive = self.get_alive_worker_count()
+        if alive >= desired:
+            return 0
+
+        needed = desired - alive
+        self._create_workers(count=needed)
+        return needed
+
     def set_idle_callback(self, callback: Optional[Callable[[], None]]) -> None:
         self.idle_callback = callback
+
+    def set_completion_callback(self, callback: Optional[Callable[[str], None]]) -> None:
+        self.on_url_completed = callback
 
     # Worker tracking --------------------------------------------------
     def _ensure_worker_tracking(self, worker_id: int):
@@ -1024,8 +1175,34 @@ class GDLQueue:
             self.worker_transfer[worker_id] = state
 
     def _clear_worker_transfer(self, worker_id: int) -> None:
+        # When a job ends, finalize the worker's downloaded bytes for this job
+        # into a persistent, script-lifetime counter.
         with self.worker_transfer_lock:
-            self.worker_transfer.pop(worker_id, None)
+            state = self.worker_transfer.pop(worker_id, None)
+
+        if state is None:
+            return
+
+        try:
+            current = self._directory_size_bytes(state.directory)
+        except Exception:
+            current = state.last_bytes
+
+        job_downloaded = max(0, int(current) - int(state.start_bytes))
+        if job_downloaded:
+            with self.total_transfer_lock:
+                self.total_downloaded_bytes += int(job_downloaded)
+                self.worker_total_downloaded_bytes[worker_id] = int(
+                    self.worker_total_downloaded_bytes.get(worker_id, 0)
+                ) + int(job_downloaded)
+
+    def get_total_downloaded_bytes(self) -> int:
+        with self.total_transfer_lock:
+            return int(self.total_downloaded_bytes)
+
+    def get_worker_total_downloaded_snapshot(self) -> Dict[int, int]:
+        with self.total_transfer_lock:
+            return dict(self.worker_total_downloaded_bytes)
 
     def get_worker_transfer_snapshot(
         self, worker_id: int
@@ -1258,7 +1435,7 @@ class GDLQueue:
 
         def _emit_buffer_as_log() -> None:
             nonlocal in_progress
-            if buffer and not in_progress:
+            if buffer:
                 line = "".join(buffer)
                 clean_line = _strip_ansi(line)
                 lowered = clean_line.lower()
@@ -1323,7 +1500,7 @@ class GDLQueue:
 
         def _process_char(ch: str) -> None:
             nonlocal in_progress
-            if ch == "\r" and os.name != "nt":
+            if ch == "\r":
                 if buffer:
                     self._set_worker_progress(worker_id, "".join(buffer))
                 buffer.clear()
@@ -1727,10 +1904,14 @@ class GDLQueue:
         """Add URL to queue. Returns True if added, False if duplicate."""
         if self.is_broken(url):
             return False
-        if url in self.queued_urls or url in self.completed_urls:
-            return False
+        with self._url_lock:
+            if url in self.queued_urls or url in self.completed_urls:
+                return False
+            self.queued_urls.add(url)
 
-        self.queued_urls.add(url)
+        # Ensure at least some workers are alive before adding work.
+        self.ensure_workers_alive()
+
         self.q.put((url, 0, directory))
         return True
 
@@ -1741,18 +1922,20 @@ class GDLQueue:
         """
         if self.is_broken(url):
             return False
-        if url in self.queued_urls:
-            return False
 
         try:
             active_urls = {u for (u, _d) in self.stats.snapshot_active().values()}
         except Exception:
             active_urls = set()
-        if url in active_urls:
-            return False
 
-        self.completed_urls.discard(url)
-        self.queued_urls.add(url)
+        with self._url_lock:
+            if url in self.queued_urls:
+                return False
+            if url in active_urls:
+                return False
+            self.completed_urls.discard(url)
+            self.queued_urls.add(url)
+
         self.q.put((url, 0, directory))
         return True
 
@@ -1779,7 +1962,34 @@ class GDLQueue:
 
     def shutdown(self):
         """Gracefully shutdown all workers."""
-        self.wait_empty()
+        # Check if any workers are still alive; if not, drain queue immediately.
+        alive_threads = [t for t in self.threads if t.is_alive()]
+        if not alive_threads:
+            # No workers alive; drain the queue to avoid deadlock in join().
+            try:
+                while True:
+                    self.q.get_nowait()
+                    self.q.task_done()
+            except queue.Empty:
+                pass
+        else:
+            # Wait for queue to drain with a timeout to avoid infinite hang.
+            # If workers die while waiting, fall through to cleanup.
+            deadline = time.time() + 30  # 30s max wait
+            while not self.q.empty() and time.time() < deadline:
+                # Re-check worker health periodically.
+                if not any(t.is_alive() for t in self.threads):
+                    break
+                time.sleep(0.5)
+
+            # Drain any remaining items if workers have died.
+            try:
+                while True:
+                    self.q.get_nowait()
+                    self.q.task_done()
+            except queue.Empty:
+                pass
+
         self.stop_event.set()
 
         # Send quit signals only to threads that are still alive.
@@ -1789,7 +1999,7 @@ class GDLQueue:
 
         # Wait for threads to finish
         for thread in alive_threads:
-            thread.join(timeout=10)
+            thread.join(timeout=5)
 
     def _worker(self, worker_id: int):
         """Worker thread that processes downloads."""
@@ -1829,10 +2039,16 @@ class GDLQueue:
                     print(
                         f"{Fore.RED}BROKEN: Worker {worker_id}: Skipping queued URL {url}\n  -> {detail}{Style.RESET_ALL}"
                     )
-                    self.queued_urls.discard(url)
+                    with self._url_lock:
+                        self.queued_urls.discard(url)
                     self.q.task_done()
                     continue
 
+                proc: Optional[subprocess.Popen] = None
+                stdout_thread: Optional[threading.Thread] = None
+                stderr_thread: Optional[threading.Thread] = None
+                start_time = time.time()
+                active_dir = Path.cwd()
                 self._set_worker_active_url(worker_id, url)
                 self._clear_unsupported(url)
 
@@ -1938,9 +2154,6 @@ class GDLQueue:
                     before_video_snapshot = self._snapshot_job_files(active_dir)
                 except Exception:
                     before_video_snapshot = {}
-                proc: Optional[subprocess.Popen] = None
-                stdout_thread: Optional[threading.Thread] = None
-                stderr_thread: Optional[threading.Thread] = None
                 timed_out = False
                 force_reappend = False
                 rate_limited_restart = False
@@ -2243,7 +2456,7 @@ class GDLQueue:
                             self._schedule_worker_restart(worker_id, delay_seconds=delay)
                             stop_worker_after_task = True
 
-                        if force_reappend:
+                        elif force_reappend:
                             self._record_worker_output(
                                 worker_id,
                                 f"[REQUEUE] HTTP 5xx threshold reached -> reappending URL in {self.config.retry_delay}s",
@@ -2278,7 +2491,9 @@ class GDLQueue:
 
                         if success:
                             self._clear_unsupported(url)
-                            self.completed_urls.add(url)
+                            with self._url_lock:
+                                self.completed_urls.add(url)
+                                self.queued_urls.discard(url)
                             self._clear_failed_download(url)
                             self._record_worker_output(
                                 worker_id,
@@ -2288,6 +2503,11 @@ class GDLQueue:
                                 f"{Fore.GREEN}SUCCESS: Worker {worker_id}: Completed {url} "
                                 f"({duration:.1f}s)"
                             )
+                            if self.on_url_completed:
+                                try:
+                                    self.on_url_completed(url)
+                                except Exception:
+                                    pass
                         else:
                             broken_detail = self.get_broken_detail(url)
                             if broken_detail and not broken_logged:
@@ -2304,7 +2524,7 @@ class GDLQueue:
                                     f"[UNSUPPORTED] {unsupported_detail}",
                                 )
                                 print(
-                                    f"{Fore.RED}UNSUPPORTED: Worker {worker_id}: gallery-dl rejected {url}\n  -> {unsupported_detail}"
+                                    f"{Fore.RED}UNSUPPORTED: Worker {worker_id}: gallery-dl rejected {url}\n  -> {unsupported_detail}{Style.RESET_ALL}"
                                 )
                             elif timed_out:
                                 self._record_worker_output(
@@ -2312,7 +2532,7 @@ class GDLQueue:
                                     "[FAIL] Download timed out after 86400s",
                                 )
                                 print(
-                                    f"{Fore.RED}TIMEOUT: Worker {worker_id}: Timeout on {url}"
+                                    f"{Fore.RED}TIMEOUT: Worker {worker_id}: Timeout on {url}{Style.RESET_ALL}"
                                 )
                             else:
                                 self._record_worker_output(
@@ -2321,13 +2541,11 @@ class GDLQueue:
                                 )
                                 print(
                                     f"{Fore.RED}FAILED: Worker {worker_id}: Failed {url} "
-                                    f"after {retry_count + 1} attempts"
+                                    f"after {retry_count + 1} attempts{Style.RESET_ALL}"
                                 )
-                            self.queued_urls.discard(url)
+                            with self._url_lock:
+                                self.queued_urls.discard(url)
                             self._record_failed_download(url, active_dir)
-
-                        if success:
-                            self.queued_urls.discard(url)
 
                 except Exception as e:
                     if proc and proc.poll() is None:
@@ -2336,12 +2554,13 @@ class GDLQueue:
                         worker_id,
                         f"[ERROR] Unexpected failure: {e}",
                     )
-                    print(f"{Fore.RED}ERROR: Worker {worker_id}: Error on {url}: {e}")
+                    print(f"{Fore.RED}ERROR: Worker {worker_id}: Error on {url}: {e}{Style.RESET_ALL}")
                     self.stats.add_completion(
                         url, False, time.time() - start_time, worker_id
                     )
                     self._maybe_notify_all_idle()
-                    self.queued_urls.discard(url)
+                    with self._url_lock:
+                        self.queued_urls.discard(url)
                     self._record_failed_download(url, active_dir)
 
                 finally:
@@ -2359,7 +2578,11 @@ class GDLQueue:
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"{Fore.RED}CRASH: Worker {worker_id} crashed: {e}")
+                print(f"{Fore.RED}CRASH: Worker {worker_id} crashed: {e}{Style.RESET_ALL}")
+                try:
+                    self.q.task_done()
+                except Exception:
+                    pass
                 break
 
 
@@ -2418,11 +2641,13 @@ class InteractiveQueue(cmd.Cmd):
         "x": "quit",
         "redo": "retry",
         "rerun": "retry",
-        "retry-all": "retry",
+        "retry-all": "retryall",
         "replay": "retry",
         "retryall": "retryall",
         "clip": "clipboard",
         "cb": "clipboard",
+        "autofolder": "af",
+        "automode": "auto",
     }
 
     intro = f"{Fore.CYAN}gallery-dl Queue v2.1{Style.RESET_ALL} – type {Fore.YELLOW}?{Style.RESET_ALL} for help"
@@ -2460,8 +2685,18 @@ class InteractiveQueue(cmd.Cmd):
         self.clipboard_whitelist_host: Optional[str] = None
         self._clipboard_stop_event = threading.Event()
         self._clipboard_thread: Optional[threading.Thread] = None
+        self._clipboard_consumer_thread: Optional[threading.Thread] = None
+        self._clipboard_ingest_queue: "queue.Queue[Optional[str]]" = queue.Queue()
         self._clipboard_last_text: Optional[str] = None
         self._clipboard_seen_urls: Set[str] = set()
+
+        # Autofolder mode: when enabled, gallery-dl metadata is probed for
+        # each added URL and the remote title/folder name is used as the
+        # download sub-directory (sanitized for the current OS).
+        self.autofolder_enabled = False
+
+        # Temporary state persistence – crash recovery for added URLs.
+        self._temp_state_lock = threading.Lock()
 
         # Load config if exists
         self._load_config()
@@ -2476,6 +2711,7 @@ class InteractiveQueue(cmd.Cmd):
             )
 
         self._start_update_check()
+        self._prompt_load_temp_state()
         self._schedule_autostart()
 
     def _compose_console_title(self) -> str:
@@ -2664,6 +2900,112 @@ class InteractiveQueue(cmd.Cmd):
                 cleaned.append(normalized)
         return cleaned
 
+    def _fetch_remote_folder_name(self, url: str, *, quiet: bool = False) -> Optional[str]:
+        """Probe gallery-dl metadata for a URL and derive a folder name.
+
+        Uses ``gallery-dl -j --no-download --range 1`` to fetch the first
+        metadata record.  The function inspects common metadata keys
+        (``gallery``, ``album``, ``title``, ``category``, ``subcategory``)
+        and returns a sanitized, OS-safe folder name, or ``None`` on failure.
+
+        When *quiet* is True, diagnostic messages are sent through the async
+        message queue instead of printed directly (thread-safe for background
+        callers such as the clipboard monitor).
+        """
+        _msg = self._notify_async if quiet else lambda m: print(m)
+
+        binary = _resolve_gallery_dl_binary(self.config)
+        if not binary:
+            return None
+
+        cmd = [
+            str(binary),
+        ] + self.config.default_args + [
+            "-j",
+            "--no-download",
+            "--range", "1",
+            url,
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                timeout=60,
+            )
+        except Exception as exc:
+            _msg(
+                f"{Fore.YELLOW}AF: metadata probe failed: {exc}{Style.RESET_ALL}"
+            )
+            return None
+
+        if result.returncode != 0:
+            stderr_snippet = (result.stderr or "").strip().splitlines()
+            detail = f" ({stderr_snippet[0][:200]})" if stderr_snippet else ""
+            _msg(
+                f"{Fore.YELLOW}AF: gallery-dl exited with {result.returncode}{detail}{Style.RESET_ALL}"
+            )
+            return None
+
+        raw = (result.stdout or "").strip()
+        if not raw:
+            return None
+
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+
+        # payload is a list of [level, file_url, metadata_dict] entries.
+        meta: Optional[dict] = None
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, list) and len(item) >= 3 and isinstance(item[2], dict):
+                    meta = item[2]
+                    break
+        elif isinstance(payload, dict):
+            meta = payload
+
+        if not meta:
+            return None
+
+        # Try a cascade of common gallery-dl metadata keys that represent
+        # the remote "folder" or "album" name.  More specific names
+        # (album_name, gallery_name) come first; generic classifiers like
+        # "subcategory" and "category" are checked last because they often
+        # contain type labels (e.g. "album") rather than the actual name.
+        candidate_keys = [
+            "album_name", "gallery_name",
+            "gallery", "album",
+            "title", "description",
+            "subcategory", "category",
+        ]
+        # Skip values that are obviously type labels rather than names.
+        _LABEL_SKIP = {
+            "album", "albums", "gallery", "galleries",
+            "image", "images", "video", "videos",
+            "media", "post", "posts", "user", "users",
+            "favorite", "favorites", "tag", "tags",
+        }
+        title: Optional[str] = None
+        for key in candidate_keys:
+            val = meta.get(key)
+            if isinstance(val, str) and val.strip():
+                cleaned = val.strip()
+                # subcategory/category often contain type labels – skip those.
+                if key in ("subcategory", "category") and cleaned.lower() in _LABEL_SKIP:
+                    continue
+                title = cleaned
+                break
+
+        if not title:
+            return None
+
+        return _sanitize_foldername(title)
+
     def _normalize_host(self, url: str) -> Optional[str]:
         try:
             parsed = urlparse(url)
@@ -2684,14 +3026,21 @@ class InteractiveQueue(cmd.Cmd):
         if self._clipboard_thread and self._clipboard_thread.is_alive():
             return
         self._clipboard_stop_event.clear()
+        # Drain any stale items from a previous run.
+        while not self._clipboard_ingest_queue.empty():
+            try:
+                self._clipboard_ingest_queue.get_nowait()
+            except queue.Empty:
+                break
 
-        def _loop() -> None:
+        def _watcher_loop() -> None:
+            """Fast polling loop – only detects clipboard changes."""
             while not self._clipboard_stop_event.is_set():
                 try:
                     text = self._read_clipboard_text()
                     if text and text != self._clipboard_last_text:
                         self._clipboard_last_text = text
-                        self._process_clipboard_text(text)
+                        self._clipboard_ingest_queue.put(text)
                 except Exception:
                     pass
                 try:
@@ -2699,18 +3048,45 @@ class InteractiveQueue(cmd.Cmd):
                 except Exception:
                     pass
 
+        def _consumer_loop() -> None:
+            """Processes queued clipboard texts (may block on autofolder)."""
+            while True:
+                try:
+                    text = self._clipboard_ingest_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if self._clipboard_stop_event.is_set():
+                        break
+                    continue
+                if text is None:  # sentinel
+                    break
+                try:
+                    self._process_clipboard_text(text)
+                except Exception:
+                    pass
+
         self._clipboard_thread = threading.Thread(
-            target=_loop,
-            name="clipboard-monitor",
+            target=_watcher_loop,
+            name="clipboard-watcher",
+            daemon=True,
+        )
+        self._clipboard_consumer_thread = threading.Thread(
+            target=_consumer_loop,
+            name="clipboard-consumer",
             daemon=True,
         )
         self._clipboard_thread.start()
+        self._clipboard_consumer_thread.start()
 
     def _stop_clipboard_monitor(self) -> None:
         self._clipboard_stop_event.set()
+        # Signal consumer to exit.
+        self._clipboard_ingest_queue.put(None)
         if self._clipboard_thread and self._clipboard_thread.is_alive():
             self._clipboard_thread.join(timeout=1)
+        if self._clipboard_consumer_thread and self._clipboard_consumer_thread.is_alive():
+            self._clipboard_consumer_thread.join(timeout=3)
         self._clipboard_thread = None
+        self._clipboard_consumer_thread = None
 
     def _process_clipboard_text(self, text: str) -> None:
         if not self.clipboard_enabled:
@@ -2751,6 +3127,134 @@ class InteractiveQueue(cmd.Cmd):
             self._notify_async(
                 f"{Fore.CYAN}CLIPBOARD: {matched_domain}/{extracted} link(s) match {self.clipboard_whitelist_host} – "
                 f"added {added_count}, skipped {skipped_seen + skipped_duplicate_queue}{Style.RESET_ALL}"
+            )
+
+    # Temp state persistence  ------------------------------------------
+    @property
+    def _temp_state_path(self) -> Path:
+        """Derive a temp-state filename from the session file."""
+        base = Path(self.config.session_file)
+        return base.with_suffix(".temp.json")
+
+    def _save_temp_state(self) -> None:
+        """Persist all not-yet-completed URLs to a lightweight temp file.
+
+        Called every time a URL is added or completed so we have crash-recovery
+        data that is always up-to-date.
+        """
+        with self._temp_state_lock:
+            try:
+                entries: list[dict[str, object]] = []
+                completed: set[str] = set()
+                if self.dlq:
+                    completed = self.dlq.snapshot_completed_urls()
+                else:
+                    completed = set(self.completed_offline)
+
+                # Pending entries (workers not started yet)
+                for pe in list(self.pending):
+                    if pe.url not in completed:
+                        entries.append({
+                            "url": pe.url,
+                            "directory": str(pe.directory) if pe.directory else None,
+                        })
+
+                # URLs that are queued/active but not yet completed
+                if self.dlq:
+                    pending_urls = {pe.url for pe in self.pending}
+                    for url in sorted(self.all_urls):
+                        if url not in completed and url not in pending_urls:
+                            entries.append({
+                                "url": url,
+                                "directory": self.url_directory_overrides.get(url),
+                            })
+
+                payload = {
+                    "temp_pending": entries,
+                    "timestamp": datetime.now().isoformat(),
+                }
+
+                target = self._temp_state_path
+                tmp = target.with_suffix(target.suffix + ".tmp")
+                tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                os.replace(tmp, target)
+            except Exception:
+                pass  # Best-effort; must not break the main flow.
+
+    def _delete_temp_state(self) -> None:
+        """Remove the temp state file (e.g. after a clean shutdown save)."""
+        try:
+            self._temp_state_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _load_temp_state_data(self) -> Optional[list]:
+        """Read the temp state file and return the raw list of entries.
+
+        Returns None when the file does not exist or is unreadable.
+        """
+        try:
+            path = self._temp_state_path
+            if not path.exists():
+                return None
+            data = json.loads(path.read_text(encoding="utf-8"))
+            entries = data.get("temp_pending")
+            if isinstance(entries, list) and entries:
+                return entries
+            return None
+        except Exception:
+            return None
+
+    def _prompt_load_temp_state(self) -> None:
+        """If a temp state file exists, ask the user whether to restore it."""
+        entries = self._load_temp_state_data()
+        if not entries:
+            return
+
+        count = len(entries)
+        ts = ""
+        try:
+            data = json.loads(self._temp_state_path.read_text(encoding="utf-8"))
+            ts = data.get("timestamp", "")
+            if ts:
+                ts = f" (saved at {ts})"
+        except Exception:
+            pass
+
+        print(
+            f"\n{Fore.CYAN}Found temporary state with {count} unsaved URL(s){ts}.{Style.RESET_ALL}"
+        )
+        try:
+            answer = input(
+                f"{Fore.YELLOW}Load these URLs? [y/N]: {Style.RESET_ALL}"
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+
+        if answer in {"y", "yes", "j", "ja"}:
+            restored = 0
+            for entry in entries:
+                url = entry.get("url") if isinstance(entry, dict) else str(entry)
+                if not url:
+                    continue
+                directory = entry.get("directory") if isinstance(entry, dict) else None
+                url = self._normalize_url(url)
+                if not url:
+                    continue
+                if not any(pe.url == url for pe in self.pending):
+                    self.pending.append(
+                        PendingEntry(url, Path(directory) if directory else None)
+                    )
+                    self.all_urls.add(url)
+                    if directory:
+                        self.url_directory_overrides[url] = directory
+                    restored += 1
+            print(
+                f"{Fore.GREEN}Restored {restored} URL(s) from temporary state.{Style.RESET_ALL}"
+            )
+        else:
+            print(
+                f"{Fore.YELLOW}Temporary state skipped – will be overwritten on next add.{Style.RESET_ALL}"
             )
 
     # Directory helpers -------------------------------------------------
@@ -2892,14 +3396,24 @@ class InteractiveQueue(cmd.Cmd):
             usage = shutil.disk_usage(path_obj)
         except (OSError, ValueError):
             return None
-        free_in_units = usage.free / (1024**3)
-        units = ["GB", "TB", "PB", "EB", "ZB"]
-        idx = 0
-        while free_in_units >= 1024 and idx < len(units) - 1:
-            free_in_units /= 1024
-            idx += 1
-        amount = f"{free_in_units:.1f}".replace(".", ",")
-        return f"{amount} {units[idx]} free space"
+        free_bytes = usage.free
+        if free_bytes < 1024**2:
+            amount = f"{free_bytes / 1024:.0f}"
+            unit = "KB"
+        elif free_bytes < 1024**3:
+            amount = f"{free_bytes / (1024**2):.1f}"
+            unit = "MB"
+        else:
+            free_in_units = free_bytes / (1024**3)
+            units = ["GB", "TB", "PB", "EB", "ZB"]
+            idx = 0
+            while free_in_units >= 1024 and idx < len(units) - 1:
+                free_in_units /= 1024
+                idx += 1
+            amount = f"{free_in_units:.1f}"
+            unit = units[idx]
+        amount = amount.replace(".", ",")
+        return f"{amount} {unit} free space"
 
     def _expanduser_mkdir(
         self,
@@ -3149,7 +3663,7 @@ class InteractiveQueue(cmd.Cmd):
                 # carry over completed URLs so duplicates stay blocked and retryall
                 # can work after starting.
                 if self.completed_offline:
-                    self.dlq.completed_urls.update(self.completed_offline)
+                    self.dlq.update_completed_urls(self.completed_offline)
 
                 # Carry over broken URL suppression loaded while offline.
                 if self.broken_offline_details:
@@ -3162,6 +3676,9 @@ class InteractiveQueue(cmd.Cmd):
                     lambda: self._notify_async(
                         f"{Fore.CYAN}All workers are idle again.{Style.RESET_ALL}"
                     )
+                )
+                self.dlq.set_completion_callback(
+                    lambda url: self._save_temp_state()
                 )
                 if self.failed_offline:
                     self.failed_offline.clear()
@@ -3453,8 +3970,8 @@ class InteractiveQueue(cmd.Cmd):
             self.all_urls.update(loaded_completed_urls)
             if self.dlq:
                 if not merge:
-                    self.dlq.completed_urls.clear()
-                self.dlq.completed_urls.update(loaded_completed_urls)
+                    self.dlq.clear_completed_urls()
+                self.dlq.update_completed_urls(loaded_completed_urls)
             else:
                 if not merge:
                     self.completed_offline.clear()
@@ -3478,6 +3995,11 @@ class InteractiveQueue(cmd.Cmd):
             self.session_url_directory = next_dir_path
         else:
             self.session_url_directory = None
+
+        # Restore autofolder mode.
+        af_value = session_data.get("autofolder_enabled")
+        if isinstance(af_value, bool):
+            self.autofolder_enabled = af_value
 
         worker_dirs_data = session_data.get("worker_directories")
         if worker_dirs_data is not None:
@@ -3587,8 +4109,8 @@ class InteractiveQueue(cmd.Cmd):
             if inferred_completed:
                 if self.dlq:
                     if not merge:
-                        self.dlq.completed_urls.clear()
-                    self.dlq.completed_urls.update(inferred_completed)
+                        self.dlq.clear_completed_urls()
+                    self.dlq.update_completed_urls(inferred_completed)
                 else:
                     if not merge:
                         self.completed_offline.clear()
@@ -3636,14 +4158,15 @@ class InteractiveQueue(cmd.Cmd):
         return
 
     def _add_url(self, url: str, *, announce: bool = True) -> bool:
-        """Add a URL to queue or pending list."""
-        normalized = self._normalize_url(url)
-        if not normalized:
+        """Add a URL to queue or pending list.
+
+        The URL is expected to be already normalized by the caller.
+        A lightweight re-validation is performed as a safety net.
+        """
+        if not url or not self._validate_url(url):
             if announce:
                 print(f"{Fore.RED}Invalid URL: {url}")
             return False
-
-        url = normalized
 
         # If clipboard is armed, learn whitelist domain from the next manual URL.
         if self.clipboard_enabled and self.clipboard_armed and announce:
@@ -3658,7 +4181,28 @@ class InteractiveQueue(cmd.Cmd):
         # Always track the URL
         self.all_urls.add(url)
 
+        # --- Autofolder: resolve remote title into a sub-directory ----------
         directory_override = self.session_url_directory
+        if self.autofolder_enabled:
+            _af_msg = print if announce else self._notify_async
+            af_name = self._fetch_remote_folder_name(url, quiet=not announce)
+            if af_name:
+                base = directory_override or self.config.download_dir or Path.cwd()
+                af_dir = Path(base) / af_name
+                try:
+                    af_dir.mkdir(parents=True, exist_ok=True)
+                except Exception as exc:
+                    _af_msg(
+                        f"{Fore.YELLOW}AF: Could not create directory '{af_dir}': {exc}{Style.RESET_ALL}"
+                    )
+                directory_override = af_dir
+                _af_msg(
+                    f"{Fore.CYAN}AF: Using autofolder → {af_dir}{Style.RESET_ALL}"
+                )
+            else:
+                _af_msg(
+                    f"{Fore.YELLOW}AF: Could not determine remote folder name for {url} – using default directory{Style.RESET_ALL}"
+                )
         added_now = False
 
         if self.dlq is None:
@@ -3699,7 +4243,50 @@ class InteractiveQueue(cmd.Cmd):
                     f"{Fore.WHITE}PENDING: URL added. Use 'start' to begin downloading, or wait for auto-start.{Style.RESET_ALL}"
                 )
 
+        if added_now:
+            self._save_temp_state()
+
         return added_now
+
+    def do_af(self, arg: str) -> bool:
+        """Toggle autofolder mode.
+
+        When enabled, every URL added (manually or via clipboard) is probed via
+        ``gallery-dl -j --no-download --range 1`` to obtain metadata. The remote
+        gallery/album/title is then used as a sub-directory name (sanitized for
+        both Windows and Linux).  The directory is created under the current
+        session directory (``workerdir``) or the global download directory.
+
+        Usage:
+          af           Toggle autofolder on/off
+          af on        Enable autofolder
+          af off       Disable autofolder
+          af status    Show current state
+        """
+        token = arg.strip().lower()
+
+        if token in {"on", "enable", "true", "1", "yes"}:
+            self.autofolder_enabled = True
+        elif token in {"off", "disable", "false", "0", "no"}:
+            self.autofolder_enabled = False
+        elif token in {"", "toggle"}:
+            self.autofolder_enabled = not self.autofolder_enabled
+        elif token in {"status", "state", "?"}:
+            state = f"{Fore.GREEN}ON" if self.autofolder_enabled else f"{Fore.YELLOW}OFF"
+            print(f"Autofolder mode: {state}{Style.RESET_ALL}")
+            return False
+        else:
+            print(f"{Fore.RED}Usage: af [on|off|status]{Style.RESET_ALL}")
+            return False
+
+        state = f"{Fore.GREEN}ON" if self.autofolder_enabled else f"{Fore.YELLOW}OFF"
+        print(f"Autofolder mode: {state}{Style.RESET_ALL}")
+        if self.autofolder_enabled:
+            print(
+                f"{Fore.CYAN}  Each added URL will be probed for its remote title/album name.\n"
+                f"  Downloads are placed in a sub-directory named after that title.{Style.RESET_ALL}"
+            )
+        return False
 
     def do_clipboard(self, arg: str) -> bool:
         """Toggle clipboard ingest automation (arm -> whitelist next manual URL -> auto-add)."""
@@ -3731,6 +4318,76 @@ class InteractiveQueue(cmd.Cmd):
         print(f"{Fore.YELLOW}CLIPBOARD: Disabled{kept}{Style.RESET_ALL}")
         return False
 
+    def do_auto(self, arg: str) -> bool:
+        """Toggle autofolder + clipboard together.
+
+        Convenience shortcut that enables (or disables) both autofolder mode
+        and clipboard monitoring in a single command.
+
+        Usage:
+          auto           Toggle both on/off
+          auto on        Enable both
+          auto off       Disable both
+          auto status    Show current state of both
+        """
+        token = arg.strip().lower()
+
+        if token in {"status", "state", "?"}:
+            af_state = f"{Fore.GREEN}ON" if self.autofolder_enabled else f"{Fore.YELLOW}OFF"
+            cb_state = f"{Fore.GREEN}ON" if self.clipboard_enabled else f"{Fore.YELLOW}OFF"
+            print(f"Autofolder : {af_state}{Style.RESET_ALL}")
+            print(f"Clipboard  : {cb_state}{Style.RESET_ALL}")
+            if self.clipboard_whitelist_host:
+                print(f"  Whitelist: {self.clipboard_whitelist_host}")
+            return False
+
+        if token in {"on", "enable", "true", "1", "yes"}:
+            want_on = True
+        elif token in {"off", "disable", "false", "0", "no"}:
+            want_on = False
+        elif token in {"", "toggle"}:
+            # Toggle based on whether at least one is currently off.
+            want_on = not (self.autofolder_enabled and self.clipboard_enabled)
+        else:
+            print(f"{Fore.RED}Usage: auto [on|off|status]{Style.RESET_ALL}")
+            return False
+
+        # Autofolder
+        self.autofolder_enabled = want_on
+        af_state = f"{Fore.GREEN}ON" if self.autofolder_enabled else f"{Fore.YELLOW}OFF"
+        print(f"Autofolder : {af_state}{Style.RESET_ALL}")
+
+        # Clipboard
+        if want_on:
+            if not sys.platform.startswith("win"):
+                print(f"{Fore.RED}CLIPBOARD: Not supported on this platform{Style.RESET_ALL}")
+                return False
+            if not self.clipboard_enabled:
+                self.clipboard_enabled = True
+                self.clipboard_armed = self.clipboard_whitelist_host is None
+                self._clipboard_last_text = None
+                self._start_clipboard_monitor()
+            cb_state = f"{Fore.GREEN}ON"
+            print(f"Clipboard  : {cb_state}{Style.RESET_ALL}")
+            if self.clipboard_armed:
+                print(
+                    f"{Fore.CYAN}  Add one URL normally to whitelist its domain, "
+                    f"then clipboard links from that domain will be queued automatically.{Style.RESET_ALL}"
+                )
+            else:
+                print(
+                    f"{Fore.CYAN}  Whitelist: {self.clipboard_whitelist_host}{Style.RESET_ALL}"
+                )
+        else:
+            if self.clipboard_enabled:
+                self.clipboard_enabled = False
+                self.clipboard_armed = False
+                self._stop_clipboard_monitor()
+            cb_state = f"{Fore.YELLOW}OFF"
+            print(f"Clipboard  : {cb_state}{Style.RESET_ALL}")
+
+        return False
+
     def do_start(self, arg: str) -> bool:
         """Start workers and begin downloading."""
         if not self._ensure_downloader():
@@ -3746,14 +4403,22 @@ class InteractiveQueue(cmd.Cmd):
             self.dlq.resume()
             print(f"{Fore.GREEN}RESUMED: Resumed workers")
 
+        # Ensure workers are alive (respawn any that have died).
+        spawned = self.dlq.ensure_workers_alive()
+        if spawned:
+            print(f"{Fore.GREEN}WORKERS: Spawned {spawned} replacement worker(s)")
+
         # Apply any stored per-worker directory overrides (including ones planned for future workers).
         self._apply_pending_worker_dir_overrides()
 
         added = 0
-        for entry in list(self.pending):
+        remaining = []
+        for entry in self.pending:
             if self.dlq.add(entry.url, entry.directory):
                 added += 1
-                self.pending.remove(entry)
+            else:
+                remaining.append(entry)
+        self.pending = remaining
 
         if added:
             print(f"{Fore.GREEN}STARTED: Added {added} URLs from pending list")
@@ -3780,6 +4445,10 @@ class InteractiveQueue(cmd.Cmd):
         """Resume paused workers or reload the last saved session when idle."""
         if self.dlq:
             self.dlq.resume()
+            # Ensure workers are alive (respawn any that have died).
+            spawned = self.dlq.ensure_workers_alive()
+            if spawned:
+                print(f"{Fore.GREEN}WORKERS: Spawned {spawned} replacement worker(s)")
             print(f"{Fore.GREEN}RESUMED: Resumed all workers")
             return False
 
@@ -3868,13 +4537,15 @@ class InteractiveQueue(cmd.Cmd):
     def do_retryall(self, arg: str) -> bool:
         """Re-queue all completed (finished) URLs to the back of the list."""
 
-        completed_set = self.dlq.completed_urls if self.dlq else self.completed_offline
+        # Snapshot the completed set to avoid mutating it while iterating
+        # (add_force discards from completed_urls).
+        completed_set = self.dlq.snapshot_completed_urls() if self.dlq else set(self.completed_offline)
         if not completed_set:
             print(f"{Fore.CYAN}No completed downloads to retry")
             return False
 
         pending_set = {entry.url for entry in self.pending}
-        queued_set = self.dlq.queued_urls if self.dlq else set()
+        queued_set = self.dlq.snapshot_queued_urls() if self.dlq else set()
         active_urls: Set[str] = set()
         if self.dlq:
             try:
@@ -3944,6 +4615,19 @@ class InteractiveQueue(cmd.Cmd):
         """Show detailed status information."""
         print(f"\n{Fore.CYAN}=== Status Report ==={Style.RESET_ALL}")
         print(f"Workers: {self.config.workers}")
+
+        # Show worker thread health
+        if self.dlq:
+            alive_count = self.dlq.get_alive_worker_count()
+            desired = self.dlq._get_desired_workers()
+            if alive_count < desired:
+                print(
+                    f"{Fore.RED}Worker threads: {alive_count}/{desired} alive "
+                    f"(use 'start' to respawn){Style.RESET_ALL}"
+                )
+            else:
+                print(f"Worker threads: {alive_count}/{desired} alive")
+
         print(f"Pending URLs: {len(self.pending)}")
         print(f"Total URLs tracked: {len(self.all_urls)}")
         failed_count = self.dlq.failed_count() if self.dlq else len(self.failed_offline)
@@ -3958,10 +4642,17 @@ class InteractiveQueue(cmd.Cmd):
             f"Clipboard: {clipboard_state} ({armed_state}), whitelist: {whitelist}, seen: {seen}"
         )
 
+        # Autofolder status
+        af_state = f"{Fore.GREEN}ON{Style.RESET_ALL}" if self.autofolder_enabled else "OFF"
+        print(f"Autofolder: {af_state}")
+
+        active_downloaded_bytes = 0
+
         if self.dlq:
             active = self.dlq.get_active_downloads()
             queue_size = self.dlq.get_queue_size()
-            completed_count = len(self.dlq.completed_urls)
+            completed_count = self.dlq.completed_count()
+            completed_snapshot = self.dlq.snapshot_completed_urls()
 
             print(f"Queue size: {queue_size}")
             print(f"Active downloads: {len(active)}")
@@ -3972,12 +4663,17 @@ class InteractiveQueue(cmd.Cmd):
             pending_url_set = {entry.url for entry in self.pending}
             urls_to_save_count = len(pending_url_set)
             for url in self.all_urls:
-                if url not in self.dlq.completed_urls and url not in pending_url_set:
+                if url not in completed_snapshot and url not in pending_url_set:
                     urls_to_save_count += 1
             print(f"URLs that would be saved: {urls_to_save_count}")
 
             if active:
                 print(f"\n{Fore.YELLOW}Active Downloads:{Style.RESET_ALL}")
+                worker_totals = {}
+                try:
+                    worker_totals = self.dlq.get_worker_total_downloaded_snapshot()
+                except Exception:
+                    worker_totals = {}
                 for worker_id, (url, active_dir) in active.items():
                     dir_label = (
                         str(active_dir)
@@ -3989,9 +4685,15 @@ class InteractiveQueue(cmd.Cmd):
                     transfer = self.dlq.get_worker_transfer_snapshot(worker_id)
                     if transfer:
                         downloaded, rate, elapsed = transfer
+                        active_downloaded_bytes += int(downloaded)
                         print(
                             f"    → Approx. Net: {_format_bytes(rate)}/s, {_format_bytes(downloaded)} in {elapsed:.0f}s"
                         )
+
+                    # Persistent per-worker counter since script start (kept even across jobs).
+                    persisted = int(worker_totals.get(worker_id, 0))
+                    if persisted or worker_id in worker_totals:
+                        print(f"    → Worker total: {_format_bytes(persisted)}")
 
             if self._has_worker_dir_overrides():
                 self._print_worker_dirs()
@@ -4004,6 +4706,17 @@ class InteractiveQueue(cmd.Cmd):
 
         session_label = self._format_directory_label(self.session_url_directory)
         print(f"Session default directory: {session_label}")
+
+        # Persistent since script start; includes currently running jobs as shown above.
+        total_downloaded = 0
+        if self.dlq:
+            total_downloaded = int(self.dlq.get_total_downloaded_bytes()) + int(
+                active_downloaded_bytes
+            )
+        else:
+            total_downloaded = 0
+
+        print(f"Total downloaded: {_format_bytes(total_downloaded)}")
 
         print(f"\n{self.stats.get_summary()}")
         return False
@@ -4251,12 +4964,20 @@ class InteractiveQueue(cmd.Cmd):
           workerdir reset|default         # clear session default directory
         """
 
-        tokens = shlex.split(arg, posix=False)
+        try:
+            tokens = shlex.split(arg, posix=False)
+        except ValueError:
+            # Unclosed quote – treat the raw arg as a single token.
+            tokens = [arg.strip()] if arg.strip() else []
 
         def _normalize_path_input(value: str) -> str:
             text = value.strip()
+            # Strip matching outer quotes.
             if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
                 text = text[1:-1]
+            # Also strip a single leading (unmatched) quote.
+            elif text and text[0] in {'"', "'"}:
+                text = text[1:]
             return text
 
         if not tokens:
@@ -4404,10 +5125,12 @@ class InteractiveQueue(cmd.Cmd):
                 # Type conversion
                 current = getattr(self.config, key)
                 try:
-                    if isinstance(current, int):
-                        value = int(value)
-                    elif isinstance(current, bool):
+                    # IMPORTANT: check bool before int because bool is a
+                    # subclass of int in Python (isinstance(True, int) == True).
+                    if isinstance(current, bool):
                         value = value.lower() in ("true", "1", "yes")
+                    elif isinstance(current, int):
+                        value = int(value)
                     elif isinstance(current, list):
                         value = value.split(",") if value else []
 
@@ -4444,7 +5167,10 @@ class InteractiveQueue(cmd.Cmd):
                                 )
                                 self._apply_pending_worker_dir_overrides()
                         except Exception as exc:
-                            print(f"{Fore.RED}Failed to resize workers: {exc}")
+                            # Roll back config to the old value.
+                            setattr(self.config, key, current)
+                            self._save_config()
+                            print(f"{Fore.RED}Failed to resize workers: {exc}{Style.RESET_ALL}")
                     elif key == "auto_status" and self.config.auto_status and self.dlq:
                         self._start_status_updates()
                     elif (
@@ -4467,38 +5193,49 @@ class InteractiveQueue(cmd.Cmd):
 
         return False
 
-    def do_save(self, arg: str) -> bool:
-        """Save current session to file."""
-        resolved = self._resolve_session_filename(
-            arg,
-            must_exist=False,
-            allowed_suffixes={".json", ".conf"},
-        )
-        filename = resolved or (arg.strip() or self.config.session_file)
+    @staticmethod
+    def _group_id_map(items: List[Tuple[str, Optional[str]]]) -> Dict[str, Dict[str, str]]:
+        """Group (url, directory) pairs into {directory: {id: url}} maps for session format v3."""
+        grouped: Dict[str, List[str]] = {}
+        for url, directory_value in items:
+            key = directory_value or ""
+            grouped.setdefault(key, []).append(url)
+        result: Dict[str, Dict[str, str]] = {}
+        for path_key, urls in grouped.items():
+            urls_sorted = sorted({u for u in urls if u})
+            id_map: Dict[str, str] = {}
+            for i, url in enumerate(urls_sorted, start=1):
+                id_map[str(i)] = url
+            result[path_key] = id_map
+        return result
 
-        # Collect all URLs that need to be saved (not yet completed)
+    def _build_session_data(
+        self,
+    ) -> Tuple[Dict[str, object], List[str], List[FailedEntry]]:
+        """Build the session data dict, uncompleted URL list, and failed entries.
+
+        Used by both ``do_save`` and ``_auto_save_on_exit``.
+        """
         urls_to_save: List[str] = []
         pending_entries: List[Tuple[str, Optional[str]]] = []
 
-        # Add pending URLs (retain their per-URL directory overrides)
         for entry in self.pending:
             urls_to_save.append(entry.url)
             pending_entries.append(
                 (entry.url, str(entry.directory) if entry.directory else None)
             )
 
-        # Add URLs that are queued but not completed
         if self.dlq:
-            completed_urls = self.dlq.completed_urls
+            completed_snapshot = self.dlq.snapshot_completed_urls()
             pending_urls_set = {entry.url for entry in self.pending}
             for url in sorted(self.all_urls):
-                if url not in completed_urls and url not in pending_urls_set:
+                if url not in completed_snapshot and url not in pending_urls_set:
                     urls_to_save.append(url)
                     directory_override = self.url_directory_overrides.get(url)
                     pending_entries.append((url, directory_override))
 
         completed_urls_sorted = (
-            sorted(self.dlq.completed_urls) if self.dlq else sorted(self.completed_offline)
+            sorted(self.dlq.snapshot_completed_urls()) if self.dlq else sorted(self.completed_offline)
         )
 
         if self.dlq:
@@ -4506,27 +5243,12 @@ class InteractiveQueue(cmd.Cmd):
         else:
             failed_entries = list(self.failed_offline.values())
 
-        # Build human-readable session format (v4): group URLs by directory.
-        def _group_id_map(items: List[Tuple[str, Optional[str]]]) -> Dict[str, Dict[str, str]]:
-            grouped: Dict[str, List[str]] = {}
-            for url, directory_value in items:
-                key = directory_value or ""
-                grouped.setdefault(key, []).append(url)
-            result: Dict[str, Dict[str, str]] = {}
-            for path_key, urls in grouped.items():
-                urls_sorted = sorted({u for u in urls if u})
-                id_map: Dict[str, str] = {}
-                for i, url in enumerate(urls_sorted, start=1):
-                    id_map[str(i)] = url
-                result[path_key] = id_map
-            return result
-
-        pending_by_path = _group_id_map(pending_entries)
+        pending_by_path = self._group_id_map(pending_entries)
 
         completed_entries: List[Tuple[str, Optional[str]]] = []
         for url in completed_urls_sorted:
             completed_entries.append((url, self.url_directory_overrides.get(url)))
-        completed_by_path = _group_id_map(completed_entries)
+        completed_by_path = self._group_id_map(completed_entries)
 
         failed_pairs: List[Tuple[str, Optional[str]]] = [
             (
@@ -4535,7 +5257,7 @@ class InteractiveQueue(cmd.Cmd):
             )
             for entry in failed_entries
         ]
-        failed_by_path = _group_id_map(failed_pairs) if failed_pairs else {}
+        failed_by_path = self._group_id_map(failed_pairs) if failed_pairs else {}
 
         broken_payload: Dict[str, str] = {}
         if self.dlq:
@@ -4569,18 +5291,21 @@ class InteractiveQueue(cmd.Cmd):
             "config": self.config.to_dict(),
             "timestamp": datetime.now().isoformat(),
             "total_urls_added": len(self.all_urls),
-            "completed_count": len(self.dlq.completed_urls)
+            "completed_count": self.dlq.completed_count()
             if self.dlq
             else len(self.completed_offline),
             "session_url_directory": str(self.session_url_directory)
             if self.session_url_directory
             else None,
+            "autofolder_enabled": self.autofolder_enabled,
         }
+
+        if self.all_urls:
+            session_data["all_urls"] = sorted(self.all_urls)
 
         if failed_by_path:
             session_data["failed_by_path"] = failed_by_path
 
-        # Keep a readable explicit override map for retryall and future-proofing.
         if self.url_directory_overrides:
             session_data["url_directory_overrides"] = dict(self.url_directory_overrides)
 
@@ -4589,6 +5314,19 @@ class InteractiveQueue(cmd.Cmd):
 
         if worker_dirs_payload:
             session_data["worker_directories"] = worker_dirs_payload
+
+        return session_data, urls_to_save, failed_entries
+
+    def do_save(self, arg: str) -> bool:
+        """Save current session to file."""
+        resolved = self._resolve_session_filename(
+            arg,
+            must_exist=False,
+            allowed_suffixes={".json", ".conf"},
+        )
+        filename = resolved or (arg.strip() or self.config.session_file)
+
+        session_data, urls_to_save, failed_entries = self._build_session_data()
 
         try:
             wrote = _write_json_atomic_if_changed(filename, session_data)
@@ -4599,6 +5337,7 @@ class InteractiveQueue(cmd.Cmd):
             print(f"Saved {len(urls_to_save)} uncompleted URLs")
             if failed_entries:
                 print(f"Saved {len(failed_entries)} failed downloads for future retry")
+            self._delete_temp_state()
         except Exception as e:
             print(f"{Fore.RED}Failed to save session: {e}")
 
@@ -4638,6 +5377,7 @@ class InteractiveQueue(cmd.Cmd):
             completed = session_data.get("completed_count", 0)
             print(f"Original session: {total} total URLs, {completed} completed")
 
+        self._save_temp_state()
         return False
 
     def do_pending(self, arg: str) -> bool:
@@ -4664,8 +5404,8 @@ class InteractiveQueue(cmd.Cmd):
         )
 
         pending_set = {entry.url for entry in self.pending}
-        completed_set = self.dlq.completed_urls if self.dlq else self.completed_offline
-        queued_set = self.dlq.queued_urls if self.dlq else set()
+        completed_set = self.dlq.snapshot_completed_urls() if self.dlq else set(self.completed_offline)
+        queued_set = self.dlq.snapshot_queued_urls() if self.dlq else set()
 
         for i, url in enumerate(sorted(self.all_urls)):
             if url in completed_set:
@@ -4720,6 +5460,7 @@ class InteractiveQueue(cmd.Cmd):
             self._forget_directory_for_url(removed.url)
             dir_msg = f" (dir: {removed.directory})" if removed.directory else ""
             print(f"{Fore.GREEN}REMOVED: Removed: {removed.url}{dir_msg}")
+            self._save_temp_state()
         else:
             print(f"{Fore.RED}Nothing removed")
 
@@ -4740,6 +5481,7 @@ class InteractiveQueue(cmd.Cmd):
 
         self.pending.clear()
         print(f"{Fore.GREEN}CLEARED: Cleared {count} pending URLs")
+        self._save_temp_state()
         return False
 
     def do_cls(self, arg: str) -> bool:
@@ -4760,7 +5502,7 @@ class InteractiveQueue(cmd.Cmd):
         self._stop_clipboard_monitor()
 
         if self.config.auto_save and (self.pending or self.dlq):
-            self.do_save("")
+            self._auto_save_on_exit()
 
         if self.dlq:
             print("WAITING: Waiting for active downloads to complete...")
@@ -4769,6 +5511,23 @@ class InteractiveQueue(cmd.Cmd):
         self._stop_async_printer()
         print(f"{Fore.GREEN}COMPLETE: All downloads complete – goodbye!")
         return True
+
+    def _auto_save_on_exit(self) -> None:
+        """Perform auto-save on exit, suppressing 'unchanged' messages."""
+        filename = self.config.session_file
+        try:
+            session_data, urls_to_save, failed_entries = self._build_session_data()
+
+            wrote = _write_json_atomic_if_changed(filename, session_data)
+            if wrote:
+                print(f"{Fore.GREEN}SAVED: Session saved to {filename}")
+                print(f"Saved {len(urls_to_save)} uncompleted URLs")
+                if failed_entries:
+                    print(f"Saved {len(failed_entries)} failed downloads for future retry")
+            self._delete_temp_state()
+            # If not written (unchanged), stay silent on exit.
+        except Exception as e:
+            print(f"{Fore.RED}Failed to auto-save session on exit: {e}")
 
     def do_EOF(self, arg: str) -> bool:
         """Handle Ctrl+D."""
@@ -4784,6 +5543,7 @@ class InteractiveQueue(cmd.Cmd):
 {Fore.YELLOW}Basic Operations:{Style.RESET_ALL}
     <url>                  Add URL to queue
     clipboard              Arm/disable clipboard auto-ingest (aliases: clip, cb)
+    af                     Toggle autofolder mode – use remote title as download subfolder (aliases: autofolder)
     start                  Start/resume workers (aliases: run, go, begin)
     pause                  Pause all workers (aliases: hold, stop)
     resume                 Resume workers or reload last session (aliases: continue, unpause)
